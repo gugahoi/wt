@@ -1,6 +1,6 @@
 # wt
 
-`wt` is a Git worktree manager for the terminal. It picks branches, GitHub issues, and pull requests with fzf, creates worktrees on demand, and opens each one in its own tmux or Rex session.
+`wt` is a Git worktree manager for the terminal. It picks branches, GitHub issues, and pull requests with fzf, creates worktrees on demand, and opens each one in its own tmux, Zellij, or Rex session, or with a command of your own.
 
 ## Install
 
@@ -10,12 +10,12 @@ brew install gugahoi/tap/wt
 
 Or download the binary for your platform (macOS or Linux, arm64 or amd64) from the [latest release](https://github.com/gugahoi/wt/releases/latest) and put `wt` on your `PATH`.
 
-`wt` is a single binary with fzf built in. It runs `git`, and `tmux` or Rex to open sessions. `wt issue` and `wt pr` log in to GitHub with `GH_TOKEN`, or with `gh` if it's installed and logged in.
+`wt` is a single binary with fzf built in. It runs `git`, and tmux, Zellij, or Rex to open sessions. `wt issue` and `wt pr` log in to GitHub with `GH_TOKEN`, or with `gh` if it's installed and logged in.
 
 ## Usage
 
 ```
-wt - Git Worktree Manager with tmux and Rex integration
+wt - Git Worktree Manager with tmux, Zellij and Rex integration
 
 Usage:
   wt                  Interactively select a branch to switch to (creating worktree if needed)
@@ -33,17 +33,38 @@ GitHub (wt issue, wt pr):
   The repository is the one gh would use (GH_REPO, or the git remotes). The token comes from GH_TOKEN or
   GITHUB_TOKEN, or else from gh's login (gh auth login).
 
-Multiplexer (WT_MULTIPLEXER=auto | tmux | rex):
-  auto, the default, opens worktrees in tmux inside tmux ($TMUX), in Rex inside a live Rex session
-  ($REX_SESSION, confirmed with the Rex server), and otherwise in tmux, creating or attaching its session.
-  tmux inside Rex picks tmux; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that fails is reported,
-  never swapped for the other, and the worktree it was opening is kept.
-  tmux  One session per branch, named after it; the same branch in two repositories shares one.
-  Rex   Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
-        labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
-        REX_CLIENT picks the Rex app when several are connected.
+Multiplexer (WT_MULTIPLEXER=auto | tmux | zellij | rex | command):
+  auto, the default, opens worktrees in the first multiplexer wt runs inside: tmux ($TMUX), Zellij ($ZELLIJ),
+  then Rex ($REX_SESSION, confirmed with the Rex server); otherwise in tmux, creating or attaching its
+  session. tmux or Zellij inside Rex picks them; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that
+  fails is reported, never swapped for another, and the worktree it was opening is kept.
+  tmux     One session per branch, named after it; the same branch in two repositories shares one.
+  zellij   One session per worktree, labelled <repo>-<branch>-<path hash> cut to 24 bytes to fit Zellij's
+           socket path; a renamed session is no longer reused. Switching sessions from inside Zellij
+           needs zellij 0.44 or later.
+  rex      Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
+           labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
+           REX_CLIENT picks the Rex app when several are connected.
+  command  Runs WT_OPEN_COMMAND with sh, in the worktree and wt's terminal, with WT_WORKTREE (its path),
+           WT_BRANCH and WT_SESSION (a <repo>-<branch>-<path hash> label) set. Never picked by auto.
   Deleting a worktree leaves its session running, and a worktree recreated at the same path reuses it.
 ```
+
+### Other multiplexers
+
+`WT_MULTIPLEXER=command` opens worktrees with any tool that has a command line. Pass the worktree through the variables, never by pasting it into the command, so that branch names stay data:
+
+```sh
+export WT_MULTIPLEXER=command
+
+# a tmux window rather than a session
+export WT_OPEN_COMMAND='tmux new-window -n "$WT_BRANCH" -c "$WT_WORKTREE"'
+
+# a WezTerm workspace (a new window each time: wezterm cli can't switch to an existing one)
+export WT_OPEN_COMMAND='wezterm cli spawn --new-window --workspace "$WT_SESSION" --cwd "$WT_WORKTREE"'
+
+# a kitty tab (needs allow_remote_control in kitty.conf)
+export WT_OPEN_COMMAND='kitten @ launch --type=tab --tab-title "$WT_BRANCH" --cwd "$WT_WORKTREE"'
 
 ## Development
 
@@ -52,7 +73,7 @@ go test ./...
 go build
 ```
 
-The tests need `git`; tmux and Rex are stubbed.
+The tests need `git`; tmux, Zellij, and Rex are stubbed.
 
 ## Releasing
 

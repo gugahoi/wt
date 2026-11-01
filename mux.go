@@ -11,94 +11,147 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
-// WT_MULTIPLEXER picks the terminal multiplexer worktrees open in: tmux, rex, or auto (the default) - tmux
-// inside tmux, Rex inside a live Rex session, and tmux otherwise. Only commands that open a worktree resolve
-// it, so listing, deletion and the fzf helpers need neither tmux nor rex.
+// WT_MULTIPLEXER picks the terminal multiplexer worktrees open in, by name, or auto (the default): the first
+// of multiplexers that wt runs inside, and tmux otherwise. Only commands that open a worktree resolve it, so
+// listing, deletion and the fzf helpers need no multiplexer.
 
-// mux is the multiplexer worktrees open in, once muxPreflight has picked and checked it.
-var mux string
-
-// muxSetting checks WT_MULTIPLEXER, so that a typo fails before any picker shows.
-func muxSetting() error {
-	switch setting := os.Getenv("WT_MULTIPLEXER"); setting {
-	case "", "auto", "tmux", "rex":
-		return nil
-	default:
-		wtError(fmt.Sprintf("WT_MULTIPLEXER must be auto, tmux or rex, not '%s'", setting))
-		return errReported
-	}
+// A multiplexer opens worktrees in sessions of its own.
+type multiplexer struct {
+	name  string // its WT_MULTIPLEXER value
+	title string // its name in messages
+	// inside tells whether wt runs in one of its sessions, for auto to pick it; nil when only picked by name.
+	inside func() bool
+	// check tells whether it can open a worktree now, before wt changes anything, reporting why not.
+	check func() error
+	// open opens the worktree at path, on branch. Its errors are reported with the worktree's path, unless
+	// it has reported them itself (errReported).
+	open func(path, branch string) error
 }
 
-// muxPreflight picks the multiplexer and checks it can open a worktree, before wt changes anything.
-// An inherited REX_SESSION can be stale, so it only counts once the server confirms it (without starting a
-// server). A multiplexer that's been picked is never swapped for the other when it fails.
+// multiplexers are those WT_MULTIPLEXER names, in the order auto tries them: tmux and Zellij run inside
+// terminal apps such as Rex, so they come first.
+var multiplexers = []*multiplexer{
+	{name: "tmux", title: "tmux", inside: func() bool { return os.Getenv("TMUX") != "" }, check: tmuxCheck, open: tmuxOpen},
+	{name: "zellij", title: "Zellij", inside: func() bool { return os.Getenv("ZELLIJ") != "" }, check: zellijCheck, open: zellijOpen},
+	{name: "rex", title: "Rex", inside: rexInside, check: rexCheck, open: rexOpen},
+	{name: "command", title: "WT_OPEN_COMMAND", check: commandCheck, open: commandOpen},
+}
+
+// mux is the multiplexer worktrees open in, once muxPreflight has picked and checked it.
+var mux *multiplexer
+
+const (
+	// rexLabelSize fits Rex's 128-character labels.
+	rexLabelSize = 111
+	// zellijLabelSize keeps a Zellij session's socket, <socket dir>/contract_version_1/<session>, within the
+	// 103 bytes macOS allows when the socket dir is Zellij's default one, in $TMPDIR.
+	zellijLabelSize = 24
+)
+
+// muxSetting is the multiplexer WT_MULTIPLEXER names, or nil for auto. Commands check it before any picker
+// shows, so that a typo fails first.
+func muxSetting() (*multiplexer, error) {
+	setting := os.Getenv("WT_MULTIPLEXER")
+	if setting == "" || setting == "auto" {
+		return nil, nil
+	}
+	names := []string{"auto"}
+	for _, m := range multiplexers {
+		if m.name == setting {
+			return m, nil
+		}
+		names = append(names, m.name)
+	}
+	last := len(names) - 1
+	wtError(fmt.Sprintf("WT_MULTIPLEXER must be %s or %s, not '%s'", strings.Join(names[:last], ", "), names[last], setting))
+	return nil, errReported
+}
+
+// muxPreflight picks the multiplexer and checks it can open a worktree, before wt changes anything. A
+// multiplexer that's been picked is never swapped for another when it fails.
 func muxPreflight() error {
-	if mux != "" {
+	if mux != nil {
 		return nil
 	}
-	if err := muxSetting(); err != nil {
+	picked, err := muxSetting()
+	if err != nil {
 		return err
 	}
-	picked := os.Getenv("WT_MULTIPLEXER")
-	if picked == "" || picked == "auto" {
-		picked = "tmux"
-		if os.Getenv("TMUX") == "" && os.Getenv("REX_SESSION") != "" && rexLive() {
-			picked = "rex"
-		}
-	}
-	if picked == "tmux" {
-		if _, err := exec.LookPath("tmux"); err != nil {
-			wtError("tmux not found")
-			return errReported
-		}
-	} else {
-		if _, err := exec.LookPath("rex"); err != nil {
-			wtError("opening worktrees in Rex needs rex")
-			return errReported
-		}
-		out, err := exec.Command("rex", "--autostart=false", "client", "inspect", "--json").CombinedOutput()
-		if err != nil {
-			wtError("no Rex app to open worktrees in (REX_CLIENT picks one): " + strings.TrimRight(string(out), "\n"))
-			return errReported
-		}
-		var client struct{ Actions []struct{ Name string } }
-		canSelect := false
-		if json.Unmarshal(out, &client) == nil {
-			for _, action := range client.Actions {
-				canSelect = canSelect || action.Name == "session.select"
+	if picked == nil {
+		picked = multiplexers[0]
+		for _, m := range multiplexers {
+			if m.inside != nil && m.inside() {
+				picked = m
+				break
 			}
 		}
-		if !canSelect {
-			wtError("the Rex app can't show sessions (no session.select action)")
-			return errReported
-		}
+	}
+	if err := picked.check(); err != nil {
+		return err
 	}
 	mux = picked
 	return nil
 }
 
-// rexLive tells whether the server knows the Rex session wt runs in.
-func rexLive() bool {
-	out, err := exec.Command("rex", "--autostart=false", "whoami", "--json").Output()
-	var whoami struct {
-		SessionID *string `json:"session_id"`
-	}
-	return err == nil && json.Unmarshal(out, &whoami) == nil && whoami.SessionID != nil
-}
-
 // muxOpenWorktree opens the worktree at path, on branch, in the multiplexer. The worktree stays when that
-// fails; tmux reports its own errors.
+// fails.
 func muxOpenWorktree(path, branch string) error {
 	if err := muxPreflight(); err != nil {
 		return err
 	}
-	if mux == "tmux" {
-		return tmuxOpen(path, branch)
+	err := mux.open(path, branch)
+	if err != nil && !errors.Is(err, errReported) {
+		wtError(fmt.Sprintf("worktree ready at %s; %s session could not be opened: %v", path, mux.title, err))
+		return errReported
 	}
-	if err := rexOpen(path, branch); err != nil {
-		wtError(fmt.Sprintf("worktree ready at %s; Rex session could not be opened: %v", path, err))
+	return err
+}
+
+// canonical is path made absolute, with symlinks resolved, so that a worktree reached through a symlink
+// opens the same session.
+func canonical(path string) (string, error) {
+	resolved, err := filepath.Abs(path)
+	if err == nil {
+		resolved, err = filepath.EvalSymlinks(resolved)
+	}
+	if err != nil {
+		return "", fmt.Errorf("can't resolve %s", path)
+	}
+	return resolved, nil
+}
+
+// sessionLabel names the session of the worktree at canonical path, on branch, <repo>-<branch>-<path hash>,
+// in at most size bytes: the hash tells apart the same branch in two repositories, and is kept whole when a
+// long name is cut. The hash is git's object ID of the path, as `git hash-object` gives it.
+func sessionLabel(path, branch string, size int) string {
+	common, _ := gitOutput("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	repo := common[:max(strings.LastIndex(common, "/"), 0)]
+	name := []rune(repo[strings.LastIndex(repo, "/")+1:] + "-" + branch)
+	for i, r := range name {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("._-", r) {
+			name[i] = '_'
+		}
+	}
+	hash := sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(path), path)))
+	suffix := "-" + hex.EncodeToString(hash[:])[:10]
+	label := string(name)
+	if cut := size - len(suffix); len(label) > cut {
+		for cut > 0 && !utf8.RuneStart(label[cut]) {
+			cut--
+		}
+		label = label[:cut]
+	}
+	return label + suffix
+}
+
+// tmux
+
+func tmuxCheck() error {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		wtError("tmux not found")
 		return errReported
 	}
 	return nil
@@ -106,6 +159,7 @@ func muxOpenWorktree(path, branch string) error {
 
 // tmuxOpen switches to (or, outside tmux, attaches) the tmux session named after the branch, creating it in
 // the worktree. Names don't include the repository, so the same branch in two repositories shares one.
+// tmux reports its own errors.
 func tmuxOpen(path, branch string) error {
 	session := strings.NewReplacer("/", "_", ".", "_", ":", "_").Replace(branch)
 	tmux := func(args ...string) error {
@@ -130,18 +184,102 @@ func tmuxOpen(path, branch string) error {
 	return nil
 }
 
+// Zellij
+
+// zellijCheck checks zellij is there and, inside Zellij, that it can switch sessions from the command line,
+// which came with Zellij 0.44.
+func zellijCheck() error {
+	if _, err := exec.LookPath("zellij"); err != nil {
+		wtError("zellij not found")
+		return errReported
+	}
+	if os.Getenv("ZELLIJ") == "" {
+		return nil
+	}
+	out, _ := exec.Command("zellij", "--version").Output()
+	version := strings.TrimSpace(string(out))
+	var major, minor int
+	if _, err := fmt.Sscanf(version, "zellij %d.%d", &major, &minor); err != nil || major == 0 && minor < 44 {
+		wtError("switching Zellij sessions needs zellij 0.44 or later, not '" + version + "'")
+		return errReported
+	}
+	return nil
+}
+
+// zellijOpen switches to (or, outside Zellij, attaches) the worktree's Zellij session (one per worktree),
+// creating it in the worktree when there's none. Sessions are found by name, so a renamed one is no longer
+// reused. Attaching reports its own errors.
+func zellijOpen(path, branch string) error {
+	path, err := canonical(path)
+	if err != nil {
+		return err
+	}
+	session := sessionLabel(path, branch, zellijLabelSize)
+	if os.Getenv("ZELLIJ") != "" {
+		// switch-session creates a missing session in --cwd, and leaves an existing one as it is
+		out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
+		if msg := strings.TrimRight(string(out), "\n"); err != nil && msg != "" {
+			return errors.New(msg)
+		}
+		return err
+	}
+	cmd := exec.Command("zellij", "attach", "--create", session)
+	cmd.Dir = path
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if cmd.Run() != nil {
+		return errReported
+	}
+	return nil
+}
+
+// Rex
+
+// rexInside tells whether wt runs in a Rex session the server knows. An inherited REX_SESSION can be stale,
+// so it only counts once the server confirms it (without starting a server).
+func rexInside() bool {
+	if os.Getenv("REX_SESSION") == "" {
+		return false
+	}
+	out, err := exec.Command("rex", "--autostart=false", "whoami", "--json").Output()
+	var whoami struct {
+		SessionID *string `json:"session_id"`
+	}
+	return err == nil && json.Unmarshal(out, &whoami) == nil && whoami.SessionID != nil
+}
+
+// rexCheck checks there's a Rex app that can show sessions.
+func rexCheck() error {
+	if _, err := exec.LookPath("rex"); err != nil {
+		wtError("opening worktrees in Rex needs rex")
+		return errReported
+	}
+	out, err := exec.Command("rex", "--autostart=false", "client", "inspect", "--json").CombinedOutput()
+	if err != nil {
+		wtError("no Rex app to open worktrees in (REX_CLIENT picks one): " + strings.TrimRight(string(out), "\n"))
+		return errReported
+	}
+	var client struct{ Actions []struct{ Name string } }
+	canSelect := false
+	if json.Unmarshal(out, &client) == nil {
+		for _, action := range client.Actions {
+			canSelect = canSelect || action.Name == "session.select"
+		}
+	}
+	if !canSelect {
+		wtError("the Rex app can't show sessions (no session.select action)")
+		return errReported
+	}
+	return nil
+}
+
 // rexOpen shows the worktree's Rex session (one per worktree), creating it in the worktree when there's
 // none. Sessions are found by their exact label, so a renamed one is no longer reused.
 func rexOpen(path, branch string) error {
-	resolved, err := filepath.Abs(path)
-	if err == nil {
-		resolved, err = filepath.EvalSymlinks(resolved)
-	}
+	path, err := canonical(path)
 	if err != nil {
-		return fmt.Errorf("can't resolve %s", path)
+		return err
 	}
-	path = resolved
-	label := rexLabel(path, branch)
+	label := sessionLabel(path, branch, rexLabelSize)
 	ids, err := rexSessions(label)
 	if err != nil {
 		return err
@@ -199,18 +337,35 @@ func rexSessions(label string) ([]string, error) {
 	return ids, nil
 }
 
-// rexLabel names the Rex session of the worktree at canonical path, on branch, <repo>-<branch>-<path hash>:
-// the hash tells apart the same branch in two repositories, and is kept whole when a long name is cut to
-// fit Rex's 128-character labels. The hash is git's object ID of the path, as `git hash-object` gives it.
-func rexLabel(path, branch string) string {
-	common, _ := gitOutput("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")
-	repo := common[:max(strings.LastIndex(common, "/"), 0)]
-	name := []rune(repo[strings.LastIndex(repo, "/")+1:] + "-" + branch)
-	for i, r := range name {
-		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("._-", r) {
-			name[i] = '_'
-		}
+// WT_OPEN_COMMAND
+
+func commandCheck() error {
+	if strings.TrimSpace(os.Getenv("WT_OPEN_COMMAND")) == "" {
+		wtError("WT_MULTIPLEXER=command needs WT_OPEN_COMMAND")
+		return errReported
 	}
-	hash := sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(path), path)))
-	return string(name[:min(len(name), 100)]) + "-" + hex.EncodeToString(hash[:])[:10]
+	if _, err := exec.LookPath("sh"); err != nil {
+		wtError("running WT_OPEN_COMMAND needs sh")
+		return errReported
+	}
+	return nil
+}
+
+// commandOpen runs WT_OPEN_COMMAND with sh, in the worktree and in wt's terminal. The worktree comes in
+// WT_WORKTREE, WT_BRANCH and WT_SESSION rather than in the command's text, so that no branch name can change
+// what it runs. The command reports its own errors; wt adds how it ended.
+func commandOpen(path, branch string) error {
+	dir, err := canonical(path)
+	if err == nil {
+		cmd := exec.Command("sh", "-c", os.Getenv("WT_OPEN_COMMAND"))
+		cmd.Dir = dir
+		cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+dir, "WT_BRANCH="+branch, "WT_SESSION="+sessionLabel(dir, branch, rexLabelSize))
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		err = cmd.Run()
+	}
+	if err != nil {
+		wtError(fmt.Sprintf("worktree ready at %s; WT_OPEN_COMMAND failed: %v", path, err))
+		return errReported
+	}
+	return nil
 }

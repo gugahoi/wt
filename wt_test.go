@@ -15,11 +15,11 @@ import (
 	"testing"
 )
 
-// The test binary also stands in for tmux and rex, and for wt itself when wt runs itself in the background:
-// tmux and rex are stubs on PATH that log their arguments, and files in $WT_STUB_DIR change their answers.
-// rex's exit codes are the real ones. No network, tmux or Rex needed.
+// The test binary also stands in for tmux, zellij and rex, and for wt itself when wt runs itself in the
+// background: they are stubs on PATH that log their arguments, and files in $WT_STUB_DIR change their
+// answers. rex's exit codes are the real ones. No network, tmux, Zellij or Rex needed.
 func TestMain(m *testing.M) {
-	if name := filepath.Base(os.Args[0]); name == "tmux" || name == "rex" {
+	if name := filepath.Base(os.Args[0]); name == "tmux" || name == "zellij" || name == "rex" {
 		os.Exit(stub(name, os.Args[1:]))
 	}
 	if os.Getenv("WT_TEST_MAIN") != "" {
@@ -79,6 +79,22 @@ func stub(name string, args []string) int {
 		}
 		return 0
 	}
+	if name == "zellij" {
+		switch args[0] {
+		case "--version":
+			version, err := os.ReadFile(filepath.Join(state, "zellij-version"))
+			if err != nil {
+				version = []byte("zellij 0.45.1\n")
+			}
+			os.Stdout.Write(version)
+		case "attach":
+			dir, _ := os.Getwd()
+			os.WriteFile(filepath.Join(state, "zellij-cwd"), []byte(dir), 0o644)
+		case "action":
+			fail("zellij-error", 1)
+		}
+		return 0
+	}
 	for strings.HasPrefix(args[0], "--") {
 		args = args[1:]
 	}
@@ -131,13 +147,14 @@ func setup(t *testing.T) *fixture {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"tmux", "rex"} {
+	for _, name := range []string{"tmux", "zellij", "rex"} {
 		if err := os.Symlink(exe, filepath.Join(f.stubs, name)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Inherited from the terminal running the tests, these would point wt at a live tmux or Rex.
-	for _, name := range []string{"TMUX", "TMUX_PANE", "REX_SESSION", "REX_BLOCK", "REX_CLIENT", "WT_MULTIPLEXER", "WT_REFRESHED", "FZF_PROMPT"} {
+	// Inherited from the terminal running the tests, these would point wt at a live tmux, Zellij or Rex.
+	for _, name := range []string{"TMUX", "TMUX_PANE", "ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID", "REX_SESSION",
+		"REX_BLOCK", "REX_CLIENT", "WT_MULTIPLEXER", "WT_OPEN_COMMAND", "WT_REFRESHED", "FZF_PROMPT"} {
 		t.Setenv(name, "")
 		os.Unsetenv(name)
 	}
@@ -157,13 +174,13 @@ func setup(t *testing.T) *fixture {
 	f.git("push", "-q", "-u", "origin", "main")
 	f.git("remote", "set-head", "origin", "main")
 
-	mux = ""
+	mux = nil
 	errOut = &f.stderr
 	pick = func(input []string, args ...string) ([]string, int) {
 		t.Fatalf("unexpected picker %q", args)
 		return nil, 0
 	}
-	t.Cleanup(func() { mux, errOut, pick = "", os.Stderr, runFzf })
+	t.Cleanup(func() { mux, errOut, pick = nil, os.Stderr, runFzf })
 	return f
 }
 
@@ -232,14 +249,14 @@ func (f *fixture) resetStubs() {
 	}
 }
 
-// pathWithout is a PATH with git and the tmux/rex stubs, except those missing.
+// pathWithout is a PATH with git, sh and the multiplexer stubs, except those missing.
 func (f *fixture) pathWithout(missing ...string) string {
 	dir := filepath.Join(f.root, "path-without-"+strings.Join(missing, "-"))
 	if _, err := os.Stat(dir); err == nil {
 		return dir
 	}
 	os.Mkdir(dir, 0o755)
-	for _, name := range []string{"git", "sh", "tmux", "rex"} {
+	for _, name := range []string{"git", "sh", "tmux", "zellij", "rex"} {
 		if found, err := exec.LookPath(name); err == nil && !slices.Contains(missing, name) {
 			os.Symlink(found, filepath.Join(dir, name))
 		}
@@ -620,8 +637,9 @@ func TestCloneInsideTmuxCreatesAndSwitches(t *testing.T) {
 // Multiplexer selection
 
 var (
-	inTmux = map[string]string{"TMUX": "/tmp/tmux-test,1,0"}
-	inRex  = map[string]string{"REX_SESSION": rexWhoamiLive["session_id"].(string)}
+	inTmux   = map[string]string{"TMUX": "/tmp/tmux-test,1,0"}
+	inZellij = map[string]string{"ZELLIJ": "0", "ZELLIJ_SESSION_NAME": "current"}
+	inRex    = map[string]string{"REX_SESSION": rexWhoamiLive["session_id"].(string)}
 )
 
 func setenv(t *testing.T, envs ...map[string]string) {
@@ -635,12 +653,12 @@ func setenv(t *testing.T, envs ...map[string]string) {
 // picked is the multiplexer muxPreflight picks, or its error.
 func (f *fixture) picked(whoami map[string]any) string {
 	f.stub("whoami.json", whoami)
-	mux = ""
+	mux = nil
 	f.stderr.Reset()
 	if err := muxPreflight(); err != nil {
 		return f.stderr.String()
 	}
-	return mux
+	return mux.name
 }
 
 func TestAutoSelection(t *testing.T) {
@@ -657,6 +675,10 @@ func TestAutoSelection(t *testing.T) {
 		{"live Rex", []map[string]string{inRex}, rexWhoamiLive, "rex"},
 		{"stale Rex", []map[string]string{inRex}, rexWhoamiStale, "tmux"},
 		{"tmux inside Rex", []map[string]string{inTmux, inRex}, rexWhoamiLive, "tmux"},
+		{"Zellij", []map[string]string{inZellij}, rexWhoamiLive, "zellij"},
+		{"Zellij inside Rex", []map[string]string{inZellij, inRex}, rexWhoamiLive, "zellij"},
+		{"tmux and Zellij", []map[string]string{inTmux, inZellij}, rexWhoamiLive, "tmux"},
+		{"WT_OPEN_COMMAND alone", []map[string]string{{"WT_OPEN_COMMAND": "true"}}, rexWhoamiLive, "tmux"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			setenv(t, c.env...)
@@ -687,6 +709,8 @@ func TestExplicitSelectionWins(t *testing.T) {
 		{"tmux inside Rex", []map[string]string{inRex, {"WT_MULTIPLEXER": "tmux"}}, "tmux"},
 		{"Rex inside tmux", []map[string]string{inTmux, {"WT_MULTIPLEXER": "rex"}}, "rex"},
 		{"Rex outside Rex", []map[string]string{{"WT_MULTIPLEXER": "rex"}}, "rex"},
+		{"Zellij inside tmux", []map[string]string{inTmux, {"WT_MULTIPLEXER": "zellij"}}, "zellij"},
+		{"command inside Zellij", []map[string]string{inZellij, {"WT_MULTIPLEXER": "command", "WT_OPEN_COMMAND": "true"}}, "command"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			setenv(t, c.env...)
@@ -700,7 +724,7 @@ func TestExplicitSelectionWins(t *testing.T) {
 func TestInvalidSettingFails(t *testing.T) {
 	f := setup(t)
 	t.Setenv("WT_MULTIPLEXER", "screen")
-	if got := f.picked(rexWhoamiLive); !strings.Contains(got, "WT_MULTIPLEXER must be auto, tmux or rex, not 'screen'") {
+	if got := f.picked(rexWhoamiLive); !strings.Contains(got, "WT_MULTIPLEXER must be auto, tmux, zellij, rex or command, not 'screen'") {
 		t.Errorf("got %q", got)
 	}
 	checkCalls(t, f.calls(), nil)
@@ -711,8 +735,8 @@ func TestRexFailureNeverFallsBackOrMemoizes(t *testing.T) {
 	setenv(t, inTmux, map[string]string{"WT_MULTIPLEXER": "rex"})
 	f.stub("client-error", "Error: rex server is not running\n")
 	for range 2 {
-		if muxPreflight() == nil || mux != "" {
-			t.Fatalf("picked %q", mux)
+		if muxPreflight() == nil || mux != nil {
+			t.Fatalf("picked %v", mux)
 		}
 	}
 	if !strings.Contains(f.stderr.String(), "rex server is not running") {
@@ -740,16 +764,20 @@ func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 	}{
 		{"invalid setting", map[string]string{"WT_MULTIPLEXER": "bogus"}, nil, "WT_MULTIPLEXER must be"},
 		{"tmux missing", map[string]string{"WT_MULTIPLEXER": "tmux", "PATH": f.pathWithout("tmux")}, nil, "tmux not found"},
+		{"zellij missing", map[string]string{"WT_MULTIPLEXER": "zellij", "PATH": f.pathWithout("zellij")}, nil, "zellij not found"},
+		{"Zellij can't switch sessions", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0"},
+			[]any{"zellij-version", "zellij 0.43.1\n"}, "needs zellij 0.44 or later, not 'zellij 0.43.1'"},
 		{"rex missing", map[string]string{"WT_MULTIPLEXER": "rex", "PATH": f.pathWithout("rex")}, nil, "needs rex"},
 		{"server down", map[string]string{"WT_MULTIPLEXER": "rex"}, []any{"client-error", "Error: rex server is not running\n"},
 			"rex server is not running"},
 		{"ambiguous apps", map[string]string{"WT_MULTIPLEXER": "rex"},
 			[]any{"client-error", "Error: 2 app clients are connected; choose one with -C\n"}, "REX_CLIENT"},
 		{"no session.select", map[string]string{"WT_MULTIPLEXER": "rex"}, []any{"inspect.json", noSelect}, "no session.select"},
+		{"no command", map[string]string{"WT_MULTIPLEXER": "command"}, nil, "needs WT_OPEN_COMMAND"},
 	} {
 		f.t.Run(c.name, func(t *testing.T) {
 			f.resetStubs()
-			mux = ""
+			mux = nil
 			f.stderr.Reset()
 			if c.stub != nil {
 				f.stub(c.stub[0].(string), c.stub[1])
@@ -765,7 +793,8 @@ func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 				t.Error("changed the repository")
 			}
 			for _, call := range f.calls() {
-				if call[0] == "tmux" || slices.Equal(call[:2], []string{"rex", "new"}) || slices.Equal(call[:2], []string{"rex", "do"}) {
+				if call[0] == "tmux" || call[0] == "zellij" && call[1] != "--version" ||
+					slices.Equal(call[:2], []string{"rex", "new"}) || slices.Equal(call[:2], []string{"rex", "do"}) {
 					t.Errorf("called %q", call)
 				}
 			}
@@ -801,7 +830,7 @@ func TestPreflightPR(t *testing.T) {
 
 func TestHelpersWorkWithoutMultiplexers(t *testing.T) {
 	f := setup(t)
-	setenv(t, map[string]string{"PATH": f.pathWithout("tmux", "rex"), "WT_MULTIPLEXER": "bogus"})
+	setenv(t, map[string]string{"PATH": f.pathWithout("tmux", "zellij", "rex"), "WT_MULTIPLEXER": "bogus"})
 	for _, args := range [][]string{{"--list-branches"}, {"--header"}, {"--lines", "issue"}, {"list"}, {"--help"}} {
 		if _, stderr, ok := f.wt(args...); !ok {
 			t.Errorf("%q failed: %s", args, stderr)
@@ -814,7 +843,7 @@ func TestHelpersWorkWithoutMultiplexers(t *testing.T) {
 
 func TestDeletionNeverCallsAMultiplexer(t *testing.T) {
 	f := setup(t)
-	setenv(t, inTmux, inRex)
+	setenv(t, inTmux, inZellij, inRex)
 	for _, branch := range []string{"gone", "gone-too"} {
 		f.git("worktree", "add", "-q", "-b", branch, filepath.Join(f.root, branch))
 	}
@@ -871,15 +900,15 @@ func TestInvalidSettingFailsBeforePickers(t *testing.T) {
 	}
 }
 
-// Rex
-
-func (f *fixture) rexSwitch(branch string) error {
-	t := f.t
-	t.Setenv("WT_MULTIPLEXER", "rex")
-	mux = ""
+// switchIn switches to branch as wt does with WT_MULTIPLEXER=name.
+func (f *fixture) switchIn(name, branch string) error {
+	f.t.Setenv("WT_MULTIPLEXER", name)
+	mux = nil
 	f.stderr.Reset()
 	return switchToBranch(branch)
 }
+
+// Rex
 
 func (f *fixture) rexCalls() [][]string {
 	var calls [][]string
@@ -907,7 +936,7 @@ func rexFixture(t *testing.T) (*fixture, string, string) {
 
 func TestRexCreatesSessionThenReusesIt(t *testing.T) {
 	f, worktree, label := rexFixture(t)
-	if err := f.rexSwitch("feature/x.y"); err != nil {
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
 	checkCalls(t, f.rexCalls(), [][]string{
@@ -916,7 +945,7 @@ func TestRexCreatesSessionThenReusesIt(t *testing.T) {
 		{"do", "session.select", "session_id=" + session(0)},
 	})
 	f.clearCalls()
-	if err := f.rexSwitch("feature/x.y"); err != nil {
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
 	checkCalls(t, f.rexCalls(), [][]string{{"ls", "--json"}, {"do", "session.select", "session_id=" + session(0)}})
@@ -924,7 +953,7 @@ func TestRexCreatesSessionThenReusesIt(t *testing.T) {
 
 func TestRexSymlinkedPathReusesSession(t *testing.T) {
 	f, worktree, _ := rexFixture(t)
-	f.rexSwitch("feature/x.y")
+	f.switchIn("rex", "feature/x.y")
 	alias := filepath.Join(f.root, "alias")
 	if err := os.Symlink(worktree, alias); err != nil {
 		t.Fatal(err)
@@ -943,7 +972,7 @@ func TestRexPrefixMatchesAreNotReused(t *testing.T) {
 		{"session_id": "session:longer", "label": label + "-2"},
 		{"session_id": "session:no-hash", "label": "repo-feature_x.y"},
 	})
-	if err := f.rexSwitch("feature/x.y"); err != nil {
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
 	calls := f.rexCalls()
@@ -956,7 +985,7 @@ func TestRexPrefixMatchesAreNotReused(t *testing.T) {
 func TestRexDuplicateLabelsFail(t *testing.T) {
 	f, worktree, label := rexFixture(t)
 	f.stub("sessions.json", []map[string]string{{"session_id": "session:a", "label": label}, {"session_id": "session:b", "label": label}})
-	if f.rexSwitch("feature/x.y") == nil {
+	if f.switchIn("rex", "feature/x.y") == nil {
 		t.Fatal("succeeded")
 	}
 	want := fmt.Sprintf("wt: worktree ready at %s; Rex session could not be opened: several sessions are labelled %s: session:a, session:b", worktree, label)
@@ -972,7 +1001,7 @@ func TestRexDuplicateLabelsFail(t *testing.T) {
 func TestRexUncertainCreationReusesCreatedSession(t *testing.T) {
 	f, worktree, label := rexFixture(t)
 	f.stub("new-error", "Error: timed out\n")
-	if err := f.rexSwitch("feature/x.y"); err != nil {
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
 	checkCalls(t, f.rexCalls(), [][]string{
@@ -986,7 +1015,7 @@ func TestRexUncertainCreationReusesCreatedSession(t *testing.T) {
 func TestRexActivationFailureKeepsWorktree(t *testing.T) {
 	f, worktree, _ := rexFixture(t)
 	f.stub("do-error", "Error: The operation couldn't be completed.\n")
-	if f.rexSwitch("feature/x.y") == nil {
+	if f.switchIn("rex", "feature/x.y") == nil {
 		t.Fatal("succeeded")
 	}
 	want := fmt.Sprintf("wt: worktree ready at %s; Rex session could not be opened: can't show session %s: Error: The operation", worktree, session(0))
@@ -1002,7 +1031,7 @@ func TestRexQuotesPathsWithSpaces(t *testing.T) {
 	f := setup(t)
 	worktree := filepath.Join(f.root, "dir with space/feature.a")
 	f.git("worktree", "add", "-q", "-b", "feature/a.b", worktree)
-	if err := f.rexSwitch("feature/a.b"); err != nil {
+	if err := f.switchIn("rex", "feature/a.b"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
 	want := []string{"new", "repo-feature_a.b-" + gitHash(worktree)[:10], "-c", worktree, "--json"}
@@ -1011,20 +1040,111 @@ func TestRexQuotesPathsWithSpaces(t *testing.T) {
 	}
 }
 
-func TestRexLabels(t *testing.T) {
+func TestSessionLabels(t *testing.T) {
 	f := setup(t)
 	a, b := filepath.Join(f.root, "a/app"), filepath.Join(f.root, "b/app")
 	for _, repo := range []string{a, b} {
 		f.run("git", "init", "-q", "-b", "main", repo)
 	}
-	if got, want := rexLabel(a, "main"), "app-main-"+gitHash(a)[:10]; got != want {
+	hash := "-" + gitHash(a)[:10]
+	if got, want := sessionLabel(a, "main", rexLabelSize), "app-main"+hash; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
-	if rexLabel(a, "main") == rexLabel(b, "main") {
+	if sessionLabel(a, "main", rexLabelSize) == sessionLabel(b, "main", rexLabelSize) {
 		t.Error("same label for two repositories")
 	}
-	long := rexLabel(a, strings.Repeat("x", 200))
-	if len(long) != 111 || !strings.HasSuffix(long, "-"+gitHash(a)[:10]) {
+	long := sessionLabel(a, strings.Repeat("x", 200), rexLabelSize)
+	if len(long) != 111 || !strings.HasSuffix(long, hash) {
 		t.Errorf("long label %q", long)
+	}
+	// Zellij's 24 bytes leave 13 for the name: a fifth é would need bytes 13 and 14
+	if got, want := sessionLabel(a, "ééééé", zellijLabelSize), "app-éééé"+hash; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// Zellij
+
+// zellijWorktree is the worktree of feature/x.y, and its Zellij session: repo-feature_x.y cut to 13 bytes.
+func zellijWorktree(f *fixture) (string, string) {
+	worktree := filepath.Join(f.repo, "feature/x.y")
+	return worktree, "repo-feature_-" + gitHash(worktree)[:10]
+}
+
+func TestZellijInsideSwitchesSession(t *testing.T) {
+	f := setup(t)
+	setenv(t, inZellij)
+	worktree, session := zellijWorktree(f)
+	if err := f.switchIn("zellij", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.calls(), [][]string{
+		{"zellij", "--version"},
+		{"zellij", "action", "switch-session", session, "--cwd", worktree},
+	})
+}
+
+func TestZellijOutsideAttachesInWorktree(t *testing.T) {
+	f := setup(t)
+	worktree, session := zellijWorktree(f)
+	if err := f.switchIn("zellij", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.calls(), [][]string{{"zellij", "attach", "--create", session}})
+	if cwd, _ := os.ReadFile(filepath.Join(f.stubState, "zellij-cwd")); string(cwd) != worktree {
+		t.Errorf("attached in %q", cwd)
+	}
+}
+
+func TestZellijFailureKeepsWorktree(t *testing.T) {
+	f := setup(t)
+	setenv(t, inZellij)
+	worktree, _ := zellijWorktree(f)
+	f.stub("zellij-error", "Error: no such layout\n")
+	if f.switchIn("zellij", "feature/x.y") == nil {
+		t.Fatal("succeeded")
+	}
+	want := "wt: worktree ready at " + worktree + "; Zellij session could not be opened: Error: no such layout"
+	if !strings.Contains(f.stderr.String(), want) {
+		t.Errorf("stderr %q", f.stderr.String())
+	}
+	if !exists(worktree) {
+		t.Error("worktree removed")
+	}
+}
+
+// WT_OPEN_COMMAND
+
+func TestCommandRunsInWorktreeWithItsDetails(t *testing.T) {
+	f := setup(t)
+	out := filepath.Join(f.root, "out")
+	setenv(t, map[string]string{"OUT": out,
+		"WT_OPEN_COMMAND": `printf '%s\n' "$WT_WORKTREE" "$WT_BRANCH" "$WT_SESSION" "$(pwd -P)" > "$OUT"`})
+	branch := "x$(touch${IFS}pwned)"
+	if err := f.switchIn("command", branch); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	worktree := filepath.Join(f.repo, branch)
+	got, _ := os.ReadFile(out)
+	if want := strings.Join([]string{worktree, branch, sessionLabel(worktree, branch, rexLabelSize), worktree, ""}, "\n"); string(got) != want {
+		t.Errorf("got %q\nwant %q", got, want)
+	}
+	if exists(filepath.Join(worktree, "pwned")) {
+		t.Error("the branch name ran as a command")
+	}
+}
+
+func TestCommandFailureKeepsWorktree(t *testing.T) {
+	f := setup(t)
+	t.Setenv("WT_OPEN_COMMAND", "exit 3")
+	if f.switchIn("command", "feature/x.y") == nil {
+		t.Fatal("succeeded")
+	}
+	worktree := filepath.Join(f.repo, "feature/x.y")
+	if want := "wt: worktree ready at " + worktree + "; WT_OPEN_COMMAND failed: exit status 3"; !strings.Contains(f.stderr.String(), want) {
+		t.Errorf("stderr %q", f.stderr.String())
+	}
+	if !exists(worktree) {
+		t.Error("worktree removed")
 	}
 }
