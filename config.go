@@ -20,7 +20,7 @@ import (
 
 // commandConfig is the user's $XDG_CONFIG_HOME/wt/config.json (~/.config/wt/config.json without it): the
 // command a picked worktree opens with, and picker keys opening it with another. Commands are shell
-// snippets, run by /bin/sh in a new window of the worktree's session; none opens a shell, reusing the session.
+// snippets, run by /bin/sh in the worktree; none opens a shell, reusing the worktree's session.
 type commandConfig struct {
 	DefaultCommand string            `json:"default_command"`
 	Keymaps        map[string]string `json:"keymaps"`

@@ -431,7 +431,7 @@ func toggleActions() string {
 // one once GitHub answers (load is unbound first so the reload doesn't retrigger it); only a first run waits
 // on GitHub.
 func cmdGitHub(kind string) error {
-	if err := muxSetting(); err != nil {
+	if _, err := muxSetting(); err != nil {
 		return err
 	}
 	cfg, err := loadCommandConfig()

@@ -110,7 +110,7 @@ func header() string {
 // cmdSwitch lists all branches and switches to the one picked, or to the new branch typed in, with the
 // command the key pressed picks.
 func cmdSwitch() error {
-	if err := muxSetting(); err != nil {
+	if _, err := muxSetting(); err != nil {
 		return err
 	}
 	cfg, err := loadCommandConfig()
@@ -150,7 +150,7 @@ func pickBranch(cfg commandConfig) (string, string, error) {
 
 // switchToBranch takes a branch picked in fzf (possibly tagged [wt] or deleting, with the picker's other
 // fields) and switches to its multiplexer session, creating the worktree - and the branch, off a freshly
-// fetched origin/<default> - when missing. A command opens in a new window of the session.
+// fetched origin/<default> - when missing. A command opens instead of a shell.
 func switchToBranch(picked, command string) error {
 	branch, fields, _ := strings.Cut(picked, "\t")
 	// The hidden ref identifies remote-only selections, including non-origin remotes.
