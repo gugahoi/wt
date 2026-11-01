@@ -10,9 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // The test binary also stands in for tmux, zellij and rex, and for wt itself when wt runs itself in the
@@ -90,6 +93,7 @@ func stub(name string, args []string) int {
 		case "attach":
 			dir, _ := os.Getwd()
 			os.WriteFile(filepath.Join(state, "zellij-cwd"), []byte(dir), 0o644)
+			fail("zellij-error", 1)
 		case "action":
 			fail("zellij-error", 1)
 		}
@@ -158,6 +162,9 @@ func setup(t *testing.T) *fixture {
 		t.Setenv(name, "")
 		os.Unsetenv(name)
 	}
+	// Where Zellij keeps its sockets decides how long its session labels can be: this short folder leaves the
+	// usual 24 bytes, whoever runs the tests and wherever their temp folder is.
+	t.Setenv("ZELLIJ_SOCKET_DIR", "/tmp/zellij")
 	t.Setenv("WT_STUB_DIR", f.stubState)
 	f.defaultPath = f.stubs + string(os.PathListSeparator) + os.Getenv("PATH")
 	t.Setenv("PATH", f.defaultPath)
@@ -756,6 +763,9 @@ func TestRexFailureNeverFallsBackOrMemoizes(t *testing.T) {
 
 func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 	noSelect := map[string]any{"actions": []any{rexInspect["actions"].([]any)[0]}}
+	// One byte less than a label needs to keep a whole character of its name before the hash
+	noRoom := socketDirLeaving(labelSuffixSize + utf8.UTFMax - 1)
+	tooLong := "Zellij's socket folder " + noRoom + "/contract_version_1 is too long for session names: set a shorter ZELLIJ_SOCKET_DIR"
 	for _, c := range []struct {
 		name    string
 		env     map[string]string
@@ -767,6 +777,15 @@ func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 		{"zellij missing", map[string]string{"WT_MULTIPLEXER": "zellij", "PATH": f.pathWithout("zellij")}, nil, "zellij not found"},
 		{"Zellij can't switch sessions", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0"},
 			[]any{"zellij-version", "zellij 0.43.1\n"}, "needs zellij 0.44 or later, not 'zellij 0.43.1'"},
+		{"Zellij version with a negative major", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0"},
+			[]any{"zellij-version", "zellij -1.0\n"}, "needs zellij 0.44 or later, not 'zellij -1.0'"},
+		{"Zellij version with a negative minor", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0"},
+			[]any{"zellij-version", "zellij 1.-1\n"}, "needs zellij 0.44 or later, not 'zellij 1.-1'"},
+		{"Zellij version with a sign", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0"},
+			[]any{"zellij-version", "zellij +1.0\n"}, "needs zellij 0.44 or later, not 'zellij +1.0'"},
+		{"Zellij socket folder too long", map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ_SOCKET_DIR": noRoom}, nil, tooLong},
+		{"Zellij socket folder too long inside Zellij",
+			map[string]string{"WT_MULTIPLEXER": "zellij", "ZELLIJ": "0", "ZELLIJ_SOCKET_DIR": noRoom}, nil, tooLong},
 		{"rex missing", map[string]string{"WT_MULTIPLEXER": "rex", "PATH": f.pathWithout("rex")}, nil, "needs rex"},
 		{"server down", map[string]string{"WT_MULTIPLEXER": "rex"}, []any{"client-error", "Error: rex server is not running\n"},
 			"rex server is not running"},
@@ -1058,7 +1077,7 @@ func TestSessionLabels(t *testing.T) {
 		t.Errorf("long label %q", long)
 	}
 	// Zellij's 24 bytes leave 13 for the name: a fifth é would need bytes 13 and 14
-	if got, want := sessionLabel(a, "ééééé", zellijLabelSize), "app-éééé"+hash; got != want {
+	if got, want := sessionLabel(a, "ééééé", zellijLabelMax), "app-éééé"+hash; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
@@ -1090,26 +1109,162 @@ func TestZellijOutsideAttachesInWorktree(t *testing.T) {
 	if err := f.switchIn("zellij", "feature/x.y"); err != nil {
 		t.Fatal(err, f.stderr.String())
 	}
-	checkCalls(t, f.calls(), [][]string{{"zellij", "attach", "--create", session}})
+	checkCalls(t, f.calls(), [][]string{{"zellij", "attach", "--create", session, "options", "--default-cwd", worktree}})
 	if cwd, _ := os.ReadFile(filepath.Join(f.stubState, "zellij-cwd")); string(cwd) != worktree {
 		t.Errorf("attached in %q", cwd)
 	}
 }
 
 func TestZellijFailureKeepsWorktree(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		env    map[string]string
+		prints string
+		want   string
+	}{
+		{"switching", inZellij, "Error: no such layout\n", "Error: no such layout"},
+		{"switching without a message", inZellij, "", "exit status 1"},
+		// Zellij has shown its own error by then, or nothing: wt still says where the worktree is
+		{"attaching", nil, "", "exit status 1"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			setenv(t, c.env)
+			worktree, _ := zellijWorktree(f)
+			f.stub("zellij-error", c.prints)
+			if f.switchIn("zellij", "feature/x.y") == nil {
+				t.Fatal("succeeded")
+			}
+			want := "wt: worktree ready at " + worktree + "; Zellij session could not be opened: " + c.want
+			if !strings.Contains(f.stderr.String(), want) {
+				t.Errorf("stderr %q", f.stderr.String())
+			}
+			if !exists(worktree) {
+				t.Error("worktree removed")
+			}
+		})
+	}
+}
+
+// Zellij 0.44 is the first that can switch sessions from the command line.
+func TestZellijVersionCheck(t *testing.T) {
 	f := setup(t)
 	setenv(t, inZellij)
-	worktree, _ := zellijWorktree(f)
-	f.stub("zellij-error", "Error: no such layout\n")
-	if f.switchIn("zellij", "feature/x.y") == nil {
-		t.Fatal("succeeded")
+	for _, c := range []struct {
+		version string
+		ok      bool
+	}{
+		{"zellij 0.43.1", false},
+		{"zellij 0.44.0", true},
+		{"zellij 0.45.1", true},
+		{"zellij 0.100.0", true},
+		{"zellij 1.0.0", true},
+	} {
+		t.Run(c.version, func(t *testing.T) {
+			f.stub("zellij-version", c.version+"\n")
+			if got := f.picked(rexWhoamiLive); (got == "zellij") != c.ok {
+				t.Errorf("got %q", got)
+			}
+		})
 	}
-	want := "wt: worktree ready at " + worktree + "; Zellij session could not be opened: Error: no such layout"
-	if !strings.Contains(f.stderr.String(), want) {
-		t.Errorf("stderr %q", f.stderr.String())
+}
+
+// zellijSocketMax is the longest socket path Zellij accepts: it turns down 104 bytes or more on macOS, and
+// 108 or more elsewhere.
+func zellijSocketMax() int {
+	if runtime.GOOS == "darwin" {
+		return 103
 	}
-	if !exists(worktree) {
-		t.Error("worktree removed")
+	return 107
+}
+
+// socketDirLeaving is a $ZELLIJ_SOCKET_DIR that leaves budget bytes for the label in the socket path of a
+// Zellij session, <dir>/contract_version_1/<label>.
+func socketDirLeaving(budget int) string {
+	return "/" + strings.Repeat("s", zellijSocketMax()-len("/contract_version_1/")-budget-1)
+}
+
+// zellijEnv sets the variables that decide where Zellij keeps its sockets; an empty one is unset.
+func zellijEnv(t *testing.T, socketDir, runtimeDir, tempDir string) {
+	for name, value := range map[string]string{"ZELLIJ_SOCKET_DIR": socketDir, "XDG_RUNTIME_DIR": runtimeDir, "TMPDIR": tempDir} {
+		t.Setenv(name, value)
+		if value == "" {
+			os.Unsetenv(name)
+		}
+	}
+}
+
+// A label gets what its session's socket folder leaves of the longest socket path, 24 bytes at most. The
+// folder is found as Zellij finds it: with macOS's usual $TMPDIR and a 3-digit uid, the default takes 79 of
+// the 103 bytes, leaving exactly 24.
+func TestZellijLabelSize(t *testing.T) {
+	uid := strconv.Itoa(os.Getuid())
+	socket := socketDirLeaving(17)
+	temp := "/" + strings.Repeat("t", 59) // 60 bytes, which leave less than 24 for a label
+	tempFolder := temp + "/zellij-" + uid + "/contract_version_1/"
+	runtimeFolder := "/run/user/1/zellij/contract_version_1/"
+	if runtime.GOOS == "darwin" {
+		runtimeFolder = tempFolder // macOS has no runtime folder
+	}
+	usual := "/var/folders/6j/6zx000hd2mz2vxf22zvty6340000gp/T/" // macOS's usual $TMPDIR: 49 bytes with its last slash
+	for _, c := range []struct {
+		name       string
+		socketDir  string
+		runtimeDir string
+		tempDir    string
+		folder     string
+	}{
+		{"$ZELLIJ_SOCKET_DIR", socket, "/run/user/1", temp, socket + "/contract_version_1/"},
+		{"$ZELLIJ_SOCKET_DIR with a slash", socket + "/", "/run/user/1", temp, socket + "/contract_version_1/"},
+		{"runtime folder", "", "/run/user/1", temp, runtimeFolder},
+		{"relative runtime folder", "", "run/user/1", temp, tempFolder},
+		{"temp folder", "", "", temp, tempFolder},
+		{"temp folder with a slash", "", "", temp + "/", tempFolder},
+		{"usual temp folder", "", "", usual, usual + "zellij-" + uid + "/contract_version_1/"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			zellijEnv(t, c.socketDir, c.runtimeDir, c.tempDir)
+			if got, want := zellijLabelSize(), min(24, zellijSocketMax()-len(c.folder)); got != want {
+				t.Errorf("got %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+// Zellij takes an empty $ZELLIJ_SOCKET_DIR as set: its sockets go in a folder of the current directory.
+func TestZellijEmptySocketDir(t *testing.T) {
+	t.Setenv("ZELLIJ_SOCKET_DIR", "")
+	if got := zellijSocketDir(); got != "contract_version_1" {
+		t.Errorf("got %q", got)
+	}
+}
+
+// A label is cut to what its socket folder leaves for it (see socketDirLeaving), at most 24 bytes, without
+// splitting a character, and keeps its hash.
+func TestZellijLabelsFitTheSocketPath(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		socketDir string
+		branch    string
+		kept      string // the part of the repository and branch that fits before the hash
+	}{
+		{"cut to the budget", socketDirLeaving(17), "feature/x.y", "repo-f"},
+		{"smallest budget", socketDirLeaving(15), "feature/x.y", "repo"},
+		{"cut between characters", socketDirLeaving(17), "ééééé", "repo-"},
+		{"cut after a character", socketDirLeaving(18), "ééééé", "repo-é"},
+		{"capped at 24", socketDirLeaving(30), "feature/x.y", "repo-feature_"},
+		{"default socket folder", "", "feature/x.y", "repo-feature_"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			zellijEnv(t, c.socketDir, "", "/tmp")
+			if err := f.switchIn("zellij", c.branch); err != nil {
+				t.Fatal(err, f.stderr.String())
+			}
+			worktree := filepath.Join(f.repo, c.branch)
+			label := c.kept + "-" + gitHash(worktree)[:10]
+			checkCalls(t, f.calls(), [][]string{{"zellij", "attach", "--create", label, "options", "--default-cwd", worktree}})
+		})
 	}
 }
 

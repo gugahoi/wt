@@ -9,6 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -46,9 +49,14 @@ var mux *multiplexer
 const (
 	// rexLabelSize fits Rex's 128-character labels.
 	rexLabelSize = 111
-	// zellijLabelSize keeps a Zellij session's socket, <socket dir>/contract_version_1/<session>, within the
-	// 103 bytes macOS allows when the socket dir is Zellij's default one, in $TMPDIR.
-	zellijLabelSize = 24
+	// zellijLabelMax is the longest label a Zellij session gets: the 24 bytes that keep its socket,
+	// $TMPDIR/zellij-<uid>/contract_version_1/<label>, within the 103 bytes macOS allows when $TMPDIR is the
+	// usual 49 bytes (with its last slash) and the uid has 3 digits. A longer socket folder makes labels
+	// shorter (zellijLabelSize), but a shorter one doesn't make them longer: sessions are found by name, so a
+	// longer label would lose the sessions already open.
+	zellijLabelMax = 24
+	// labelSuffixSize is the size of the -<path hash> that ends every label: a dash and 10 hexadecimal digits.
+	labelSuffixSize = 11
 )
 
 // muxSetting is the multiplexer WT_MULTIPLEXER names, or nil for auto. Commands check it before any picker
@@ -124,8 +132,9 @@ func canonical(path string) (string, error) {
 }
 
 // sessionLabel names the session of the worktree at canonical path, on branch, <repo>-<branch>-<path hash>,
-// in at most size bytes: the hash tells apart the same branch in two repositories, and is kept whole when a
-// long name is cut. The hash is git's object ID of the path, as `git hash-object` gives it.
+// in at most size bytes, labelSuffixSize+utf8.UTFMax or more, to leave room for a whole character of the
+// name. The hash tells apart the same branch in two repositories, and is kept whole when a long name is
+// cut. The hash is git's object ID of the path, as `git hash-object` gives it.
 func sessionLabel(path, branch string, size int) string {
 	common, _ := gitOutput("-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	repo := common[:max(strings.LastIndex(common, "/"), 0)]
@@ -136,7 +145,7 @@ func sessionLabel(path, branch string, size int) string {
 		}
 	}
 	hash := sha1.Sum([]byte(fmt.Sprintf("blob %d\x00%s", len(path), path)))
-	suffix := "-" + hex.EncodeToString(hash[:])[:10]
+	suffix := "-" + hex.EncodeToString(hash[:])[:labelSuffixSize-1]
 	label := string(name)
 	if cut := size - len(suffix); len(label) > cut {
 		for cut > 0 && !utf8.RuneStart(label[cut]) {
@@ -149,6 +158,7 @@ func sessionLabel(path, branch string, size int) string {
 
 // tmux
 
+// tmuxCheck checks tmux is there.
 func tmuxCheck() error {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		wtError("tmux not found")
@@ -186,11 +196,59 @@ func tmuxOpen(path, branch string) error {
 
 // Zellij
 
-// zellijCheck checks zellij is there and, inside Zellij, that it can switch sessions from the command line,
-// which came with Zellij 0.44.
+// pushPath appends elem to path, after a slash unless path is empty or ends in one, as Rust's PathBuf::push
+// does for Zellij. filepath.Join would also clean the result, and Zellij limits the length of what it built.
+func pushPath(path, elem string) string {
+	if path == "" || strings.HasSuffix(path, "/") {
+		return path + elem
+	}
+	return path + "/" + elem
+}
+
+// zellijSocketDir is the folder of Zellij's session sockets, found as Zellij finds it: $ZELLIJ_SOCKET_DIR,
+// else the runtime folder, $XDG_RUNTIME_DIR/zellij, else zellij-<uid> in the temp folder; then
+// contract_version_1 (zellij-utils/src/consts.rs:332-347 in v0.45.1, 282-297 in v0.44.0). The runtime folder
+// is for an absolute $XDG_RUNTIME_DIR only, and macOS has none (directories crate, src/lin.rs:72 and
+// src/mac.rs:82, the same in 5.0 as in 6.0).
+func zellijSocketDir() string {
+	dir, set := os.LookupEnv("ZELLIJ_SOCKET_DIR")
+	if !set {
+		if xdg := os.Getenv("XDG_RUNTIME_DIR"); runtime.GOOS != "darwin" && filepath.IsAbs(xdg) {
+			dir = pushPath(xdg, "zellij")
+		} else {
+			dir = pushPath(os.TempDir(), "zellij-"+strconv.Itoa(os.Getuid()))
+		}
+	}
+	return pushPath(dir, "contract_version_1")
+}
+
+// zellijLabelSize is the longest label a Zellij session can have: zellijLabelMax, or fewer bytes when the
+// session's socket, <socket folder>/<label>, would reach the length Zellij turns down: 104 on macOS, 108
+// elsewhere (zellij-client/src/lib.rs:357-372 and zellij-utils/src/consts.rs:325-329, v0.45.1). v0.44.0
+// checks --session alone (zellij-utils/src/cli.rs:13-35), against 108 on macOS too, so a label that fits
+// those limits fits it as well.
+func zellijLabelSize() int {
+	longest := 107
+	if runtime.GOOS == "darwin" {
+		longest = 103
+	}
+	return min(zellijLabelMax, longest-len(zellijSocketDir())-1)
+}
+
+// zellijVersion matches the output of zellij --version, as zellij 0.45.1, for its major and minor numbers.
+var zellijVersion = regexp.MustCompile(`^zellij ([0-9]+)\.([0-9]+)`)
+
+// zellijCheck checks zellij is there, that its socket folder leaves room for session names and, inside
+// Zellij, that it can switch sessions from the command line, which came with Zellij 0.44.
 func zellijCheck() error {
 	if _, err := exec.LookPath("zellij"); err != nil {
 		wtError("zellij not found")
+		return errReported
+	}
+	// The name must keep a whole character: cut to nothing, the label would start with the hash's dash, which
+	// Zellij's command line takes for an option.
+	if zellijLabelSize() < labelSuffixSize+utf8.UTFMax {
+		wtError("Zellij's socket folder " + zellijSocketDir() + " is too long for session names: set a shorter ZELLIJ_SOCKET_DIR")
 		return errReported
 	}
 	if os.Getenv("ZELLIJ") == "" {
@@ -199,7 +257,12 @@ func zellijCheck() error {
 	out, _ := exec.Command("zellij", "--version").Output()
 	version := strings.TrimSpace(string(out))
 	var major, minor int
-	if _, err := fmt.Sscanf(version, "zellij %d.%d", &major, &minor); err != nil || major == 0 && minor < 44 {
+	if m := zellijVersion.FindStringSubmatch(version); m != nil {
+		// Atoi only fails on a number too big for an int, and that is later than 0.44
+		major, _ = strconv.Atoi(m[1])
+		minor, _ = strconv.Atoi(m[2])
+	}
+	if major == 0 && minor < 44 {
 		wtError("switching Zellij sessions needs zellij 0.44 or later, not '" + version + "'")
 		return errReported
 	}
@@ -208,13 +271,13 @@ func zellijCheck() error {
 
 // zellijOpen switches to (or, outside Zellij, attaches) the worktree's Zellij session (one per worktree),
 // creating it in the worktree when there's none. Sessions are found by name, so a renamed one is no longer
-// reused. Attaching reports its own errors.
+// reused. Attaching shows Zellij's own errors, and returns how it ended.
 func zellijOpen(path, branch string) error {
 	path, err := canonical(path)
 	if err != nil {
 		return err
 	}
-	session := sessionLabel(path, branch, zellijLabelSize)
+	session := sessionLabel(path, branch, zellijLabelSize())
 	if os.Getenv("ZELLIJ") != "" {
 		// switch-session creates a missing session in --cwd, and leaves an existing one as it is
 		out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
@@ -223,13 +286,12 @@ func zellijOpen(path, branch string) error {
 		}
 		return err
 	}
-	cmd := exec.Command("zellij", "attach", "--create", session)
+	// attach has no --cwd: a new session starts in the default cwd, which options sets over the
+	// configuration's, or else in the directory zellij runs in. An existing session stays as it is.
+	cmd := exec.Command("zellij", "attach", "--create", session, "options", "--default-cwd", path)
 	cmd.Dir = path
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if cmd.Run() != nil {
-		return errReported
-	}
-	return nil
+	return cmd.Run()
 }
 
 // Rex
@@ -339,6 +401,7 @@ func rexSessions(label string) ([]string, error) {
 
 // WT_OPEN_COMMAND
 
+// commandCheck checks there's a WT_OPEN_COMMAND to run, and sh to run it with.
 func commandCheck() error {
 	if strings.TrimSpace(os.Getenv("WT_OPEN_COMMAND")) == "" {
 		wtError("WT_MULTIPLEXER=command needs WT_OPEN_COMMAND")

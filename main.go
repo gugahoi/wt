@@ -95,9 +95,9 @@ Multiplexer (WT_MULTIPLEXER=auto | tmux | zellij | rex | command):
   session. tmux or Zellij inside Rex picks them; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that
   fails is reported, never swapped for another, and the worktree it was opening is kept.
   tmux     One session per branch, named after it; the same branch in two repositories shares one.
-  zellij   One session per worktree, labelled <repo>-<branch>-<path hash> cut to 24 bytes to fit Zellij's
-           socket path; a renamed session is no longer reused. Switching sessions from inside Zellij
-           needs zellij 0.44 or later.
+  zellij   One session per worktree, labelled <repo>-<branch>-<path hash> cut to at most 24 bytes, fewer
+           when Zellij's socket folder is long, so the socket path fits; a renamed session is no longer
+           reused. Switching sessions from inside Zellij needs zellij 0.44 or later.
   rex      Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
            labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
            REX_CLIENT picks the Rex app when several are connected.
