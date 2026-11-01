@@ -430,7 +430,7 @@ func toggleActions() string {
 // one. The cached list shows straight away and is swapped for a fresh one once GitHub answers (load is
 // unbound first so the reload doesn't retrigger it); only a first run waits on GitHub.
 func cmdGitHub(kind string) error {
-	if err := muxSetting(); err != nil {
+	if _, err := muxSetting(); err != nil {
 		return err
 	}
 	prompt := "Issue> "

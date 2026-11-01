@@ -1,5 +1,6 @@
 // Command wt is a Git worktree manager for the terminal. It picks branches, GitHub issues and pull requests
-// with fzf, creates worktrees on demand, and opens each one in its own tmux or Rex session.
+// with fzf, creates worktrees on demand, and opens each one in its own tmux, Zellij or Rex session, or with a
+// command of the user's.
 //
 // fzf runs in-process, but its key bindings and previews run commands: they call wt back through the
 // hidden --flags below, so those are an interface between wt and the pickers it shows.
@@ -70,7 +71,7 @@ func run(args []string) int {
 	return 0
 }
 
-const help = `wt - Git Worktree Manager with tmux and Rex integration
+const help = `wt - Git Worktree Manager with tmux, Zellij and Rex integration
 
 Usage:
   wt                  Interactively select a branch to switch to (creating worktree if needed)
@@ -88,15 +89,20 @@ GitHub (wt issue, wt pr):
   The repository is the one gh would use (GH_REPO, or the git remotes). The token comes from GH_TOKEN or
   GITHUB_TOKEN, or else from gh's login (gh auth login).
 
-Multiplexer (WT_MULTIPLEXER=auto | tmux | rex):
-  auto, the default, opens worktrees in tmux inside tmux ($TMUX), in Rex inside a live Rex session
-  ($REX_SESSION, confirmed with the Rex server), and otherwise in tmux, creating or attaching its session.
-  tmux inside Rex picks tmux; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that fails is reported,
-  never swapped for the other, and the worktree it was opening is kept.
-  tmux  One session per branch, named after it; the same branch in two repositories shares one.
-  Rex   Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
-        labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
-        REX_CLIENT picks the Rex app when several are connected.
+Multiplexer (WT_MULTIPLEXER=auto | tmux | zellij | rex | command):
+  auto, the default, opens worktrees in the first multiplexer wt runs inside: tmux ($TMUX), Zellij ($ZELLIJ),
+  then Rex ($REX_SESSION, confirmed with the Rex server); otherwise in tmux, creating or attaching its
+  session. tmux or Zellij inside Rex picks them; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that
+  fails is reported, never swapped for another, and the worktree it was opening is kept.
+  tmux     One session per branch, named after it; the same branch in two repositories shares one.
+  zellij   One session per worktree, labelled <repo>-<branch>-<path hash> cut to at most 24 bytes, fewer
+           when Zellij's socket folder is long, so the socket path fits; a renamed session is no longer
+           reused. Switching sessions from inside Zellij needs zellij 0.44 or later.
+  rex      Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
+           labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
+           REX_CLIENT picks the Rex app when several are connected.
+  command  Runs WT_OPEN_COMMAND with sh, in the worktree and wt's terminal, with WT_WORKTREE (its path),
+           WT_BRANCH and WT_SESSION (a <repo>-<branch>-<path hash> label) set. Never picked by auto.
   Deleting a worktree leaves its session running, and a worktree recreated at the same path reuses it.
 `
 

@@ -109,7 +109,7 @@ func header() string {
 
 // cmdSwitch lists all branches and switches to the one picked, or to the new branch typed in.
 func cmdSwitch() error {
-	if err := muxSetting(); err != nil {
+	if _, err := muxSetting(); err != nil {
 		return err
 	}
 	branch, err := pickBranch()
