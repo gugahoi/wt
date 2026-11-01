@@ -609,6 +609,43 @@ func TestIssuesAndPRsAreNewestFirst(t *testing.T) {
 	}
 }
 
+// A missing branch marker must still leave a non-whitespace right field for --freeze-right=1.
+// Otherwise fzf trims that field away and clips the beginning of a long issue title.
+func TestIssueRowsKeepTitleStartAndRightMarker(t *testing.T) {
+	f := setup(t)
+	f.git("branch", "2-topic")
+	f.git("worktree", "add", "-q", "-b", "3-topic", filepath.Join(f.root, "3-topic"))
+	title := strings.Repeat("Long issue title ", 12)
+	if err := writeCache("issues", []string{
+		"1\t2026-01-01\t" + title + "\tmaintenance",
+		"2\t2026-01-02\t" + title + "\t",
+		"3\t2026-01-03\t" + title + "\t",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"1": "·", "2": "[br]", "3": "[wt]"}
+	rows := issueLines()
+	if len(rows) != len(want) {
+		t.Fatalf("got %d issue rows, want %d", len(rows), len(want))
+	}
+	for _, row := range rows {
+		fields := strings.Split(row, "\t")
+		if len(fields) != 5 || fields[0] != "issue" {
+			t.Fatalf("bad issue row %q", row)
+		}
+		number := fields[1]
+		if !strings.HasPrefix(fields[3], "#"+number+"  "+title) || len(fields[3]) < 300 {
+			t.Errorf("issue %s lost its title prefix or padding: %q", number, fields[3])
+		}
+		// Simulate fzf's ANSI and trailing-whitespace removal: the right field must survive.
+		shown := strings.TrimRight(ansi.ReplaceAllString(strings.Join(fields[3:], "\t"), ""), " \t")
+		visible := strings.Split(shown, "\t")
+		if len(visible) != 2 || strings.TrimSpace(visible[1]) != want[number] {
+			t.Errorf("issue %s right field: %q, want %q", number, shown, want[number])
+		}
+	}
+}
+
 func TestPRReviewStatus(t *testing.T) {
 	setup(t)
 	prs := decode[pullRequest](t, `[
@@ -1885,6 +1922,44 @@ func TestPickersShownDespiteDefaultOptions(t *testing.T) {
 	}
 	if opts.Exit0 || opts.Filter != nil {
 		t.Errorf("exit-0 %t, filter mode %t", opts.Exit0, opts.Filter != nil)
+	}
+}
+
+// Both GitHub pickers must override user defaults that wrap or keep the right end, as those modes undo
+// the title-prefix/right-marker layout.
+func TestGitHubPickerKeepsFrozenRightWithoutClippingTitleStart(t *testing.T) {
+	setup(t)
+	t.Setenv("FZF_DEFAULT_OPTS", "--wrap --keep-right")
+	t.Setenv("FZF_DEFAULT_OPTS_FILE", "")
+	if err := writeCache("issues", []string{"1\t2026-01-01\tIssue title\t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCache("prs", []string{"2\t2026-01-01\tfalse\tfalse\tbranch\tPR title\tme\t\tnone\tfalse"}); err != nil {
+		t.Fatal(err)
+	}
+	shown := 0
+	pick = func(input []string, args ...string) ([]string, int) {
+		shown++
+		if len(input) != 1 {
+			t.Errorf("picker input: %q", input)
+		}
+		opts, err := fzfOptions(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.FreezeRight != 1 || opts.Wrap || opts.KeepRight || opts.WithNthExpr != "4.." {
+			t.Errorf("picker layout: freeze-right=%d, wrap=%t, keep-right=%t, with-nth=%q",
+				opts.FreezeRight, opts.Wrap, opts.KeepRight, opts.WithNthExpr)
+		}
+		return nil, fzf.ExitInterrupt
+	}
+	for _, kind := range []string{"issue", "pr"} {
+		if err := cmdGitHub(kind); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if shown != 2 {
+		t.Errorf("shown %d pickers, want 2", shown)
 	}
 }
 
