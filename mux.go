@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -29,9 +31,9 @@ type multiplexer struct {
 	inside func() bool
 	// check tells whether it can open a worktree now, before wt changes anything, reporting why not.
 	check func() error
-	// open opens the worktree at path, on branch. Its errors are reported with the worktree's path, unless
-	// it has reported them itself (errReported).
-	open func(path, branch string) error
+	// open opens the worktree at path, on branch: with a shell, or with command when it isn't empty. Its
+	// errors are reported with the worktree's path, unless it has reported them itself (errReported).
+	open func(path, branch, command string) error
 }
 
 // multiplexers are those WT_MULTIPLEXER names, in the order auto tries them: tmux and Zellij run inside
@@ -104,13 +106,13 @@ func muxPreflight() error {
 	return nil
 }
 
-// muxOpenWorktree opens the worktree at path, on branch, in the multiplexer. The worktree stays when that
-// fails.
-func muxOpenWorktree(path, branch string) error {
+// muxOpenWorktree opens the worktree at path, on branch, in the multiplexer, with command instead of a shell
+// when it isn't empty. The worktree stays when that fails.
+func muxOpenWorktree(path, branch, command string) error {
 	if err := muxPreflight(); err != nil {
 		return err
 	}
-	err := mux.open(path, branch)
+	err := mux.open(path, branch, command)
 	if err != nil && !errors.Is(err, errReported) {
 		wtError(fmt.Sprintf("worktree ready at %s; %s session could not be opened: %v", path, mux.title, err))
 		return errReported
@@ -169,29 +171,50 @@ func tmuxCheck() error {
 
 // tmuxOpen switches to (or, outside tmux, attaches) the tmux session named after the branch, creating it in
 // the worktree. Names don't include the repository, so the same branch in two repositories shares one.
-// tmux reports its own errors.
-func tmuxOpen(path, branch string) error {
+// A command runs in a new window of the session, or in the first window of the session it creates. tmux
+// reports its own errors.
+func tmuxOpen(path, branch, command string) error {
 	session := strings.NewReplacer("/", "_", ".", "_", ":", "_").Replace(branch)
 	tmux := func(args ...string) error {
 		cmd := exec.Command("tmux", args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		return cmd.Run()
+		if cmd.Run() != nil {
+			return errReported
+		}
+		return nil
+	}
+	inside := os.Getenv("TMUX") != ""
+	window := []string{"-c", path}
+	if command != "" {
+		// tmux reads an argument ending in ";" as a command separator, dropping a backslash before it, so a
+		// command ending in ";" (find -exec ... \;) needs one more.
+		if strings.HasSuffix(command, ";") {
+			command = command[:len(command)-1] + `\;`
+		}
+		window = append(window, "/bin/sh", "-c", command)
+	}
+	if command == "" && !inside {
+		return tmux(append([]string{"new-session", "-A", "-s", session}, window...)...)
+	}
+	exists := exec.Command("tmux", "has-session", "-t", "="+session).Run() == nil
+	if !exists && !inside {
+		// Attached as it's created: -A would attach to a session created since the check, without the command.
+		return tmux(append([]string{"new-session", "-s", session}, window...)...)
 	}
 	var err error
-	if os.Getenv("TMUX") != "" {
-		if exec.Command("tmux", "has-session", "-t", "="+session).Run() != nil {
-			err = tmux("new-session", "-d", "-s", session, "-c", path)
-		}
-		if err == nil {
-			err = tmux("switch-client", "-t", "="+session)
-		}
-	} else {
-		err = tmux("new-session", "-A", "-s", session, "-c", path)
+	if !exists {
+		err = tmux(append([]string{"new-session", "-d", "-s", session}, window...)...)
+	} else if command != "" {
+		// The trailing colon picks the session's next free window index.
+		err = tmux(append([]string{"new-window", "-t", "=" + session + ":"}, window...)...)
 	}
 	if err != nil {
-		return errReported
+		return err
 	}
-	return nil
+	if inside {
+		return tmux("switch-client", "-t", "="+session)
+	}
+	return tmux("attach-session", "-t", "="+session)
 }
 
 // Zellij
@@ -235,8 +258,28 @@ func zellijLabelSize() int {
 	return min(zellijLabelMax, longest-len(zellijSocketDir())-1)
 }
 
-// zellijVersion matches the output of zellij --version, as zellij 0.45.1, for its major and minor numbers.
-var zellijVersion = regexp.MustCompile(`^zellij ([0-9]+)\.([0-9]+)`)
+// zellijVersion matches the output of zellij --version, as zellij 0.45.1, for its major, minor and patch
+// numbers.
+var zellijVersion = regexp.MustCompile(`^zellij ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
+
+// zellijInstalled is what zellij --version says, and the three numbers in it: 0.0.0 when it says none.
+func zellijInstalled() (string, []int) {
+	out, _ := exec.Command("zellij", "--version").Output()
+	version := strings.TrimSpace(string(out))
+	numbers := make([]int, 3)
+	if m := zellijVersion.FindStringSubmatch(version); m != nil {
+		for i := range numbers {
+			// Atoi only fails on a missing patch number, or on one too big for an int, which is later than any
+			numbers[i], _ = strconv.Atoi(m[i+1])
+		}
+	}
+	return version, numbers
+}
+
+// zellijSince tells whether version numbers are major.minor.patch or later.
+func zellijSince(numbers []int, major, minor, patch int) bool {
+	return slices.Compare(numbers, []int{major, minor, patch}) >= 0
+}
 
 // zellijCheck checks zellij is there, that its socket folder leaves room for session names and, inside
 // Zellij, that it can switch sessions from the command line, which came with Zellij 0.44.
@@ -254,15 +297,7 @@ func zellijCheck() error {
 	if os.Getenv("ZELLIJ") == "" {
 		return nil
 	}
-	out, _ := exec.Command("zellij", "--version").Output()
-	version := strings.TrimSpace(string(out))
-	var major, minor int
-	if m := zellijVersion.FindStringSubmatch(version); m != nil {
-		// Atoi only fails on a number too big for an int, and that is later than 0.44
-		major, _ = strconv.Atoi(m[1])
-		minor, _ = strconv.Atoi(m[2])
-	}
-	if major == 0 && minor < 44 {
+	if version, numbers := zellijInstalled(); !zellijSince(numbers, 0, 44, 0) {
 		wtError("switching Zellij sessions needs zellij 0.44 or later, not '" + version + "'")
 		return errReported
 	}
@@ -271,27 +306,170 @@ func zellijCheck() error {
 
 // zellijOpen switches to (or, outside Zellij, attaches) the worktree's Zellij session (one per worktree),
 // creating it in the worktree when there's none. Sessions are found by name, so a renamed one is no longer
-// reused. Attaching shows Zellij's own errors, and returns how it ended.
-func zellijOpen(path, branch string) error {
+// reused. A command runs in a new tab of the session, shown; or in the first tab of the session created for
+// it, from zellij 0.45.1, which can start a session with one: before, the new session has its shell tab
+// first. Attaching shows Zellij's own errors, and returns how it ended.
+func zellijOpen(path, branch, command string) error {
 	path, err := canonical(path)
 	if err != nil {
 		return err
 	}
 	session := sessionLabel(path, branch, zellijLabelSize())
-	if os.Getenv("ZELLIJ") != "" {
-		// switch-session creates a missing session in --cwd, and leaves an existing one as it is
-		out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
-		if msg := strings.TrimRight(string(out), "\n"); err != nil && msg != "" {
-			return errors.New(msg)
+	inside := os.Getenv("ZELLIJ") != ""
+	if command == "" {
+		if inside {
+			return zellijSwitch(session, path)
 		}
+		return zellijAttach(session, path).Run()
+	}
+	// zellijCheck doesn't know there's a command, so its version is checked here, before Zellij is changed
+	version, numbers := zellijInstalled()
+	if !zellijSince(numbers, 0, 44, 0) {
+		return fmt.Errorf("opening a worktree with a command needs zellij 0.44 or later, not '%s'", version)
+	}
+	if zellijSince(numbers, 0, 45, 1) {
+		exists, err := zellijSessionExists(session)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return zellijCreate(session, path, command, inside)
+		}
+	}
+	// The session is shown before the tab is opened: zellij 0.45 has no room for a tab when no client is
+	// connected to size it.
+	if inside {
+		if err := zellijSwitch(session, path); err != nil {
+			return err
+		}
+		return zellijTab(session, path, command, nil)
+	}
+	attach := zellijAttach(session, path)
+	if err := attach.Start(); err != nil {
 		return err
 	}
+	ended := make(chan struct{})
+	var attachErr error
+	go func() {
+		attachErr = attach.Wait()
+		close(ended)
+	}()
+	tabErr := zellijTab(session, path, command, ended)
+	<-ended
+	if attachErr != nil {
+		return attachErr
+	}
+	return tabErr
+}
+
+// zellijAttach is the command that attaches to the session in wt's terminal, creating it in the worktree at
+// path when there's none.
+func zellijAttach(session, path string) *exec.Cmd {
 	// attach has no --cwd: a new session starts in the default cwd, which options sets over the
 	// configuration's, or else in the directory zellij runs in. An existing session stays as it is.
-	cmd := exec.Command("zellij", "attach", "--create", session, "options", "--default-cwd", path)
-	cmd.Dir = path
+	return zellijTerminal(path, "attach", "--create", session, "options", "--default-cwd", path)
+}
+
+// zellijTerminal is zellij with args, run in the directory dir and wt's terminal.
+func zellijTerminal(dir string, args ...string) *exec.Cmd {
+	cmd := exec.Command("zellij", args...)
+	cmd.Dir = dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	return cmd
+}
+
+// zellijSwitch switches the client of the Zellij session wt runs in to the worktree's session.
+func zellijSwitch(session, path string) error {
+	// switch-session creates a missing session in --cwd, and leaves an existing one as it is
+	out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
+	if err != nil {
+		return zellijFailure(out, err)
+	}
+	return nil
+}
+
+// zellijFailure is why a zellij command failed: its message, or else how it ended.
+func zellijFailure(out []byte, err error) error {
+	if msg := strings.TrimRight(string(out), "\n"); msg != "" {
+		return errors.New(msg)
+	}
+	return err
+}
+
+// zellijSessionExists tells whether Zellij has a session called name, running or exited: attaching to an
+// exited one brings it back as it was.
+func zellijSessionExists(name string) (bool, error) {
+	out, err := exec.Command("zellij", "list-sessions", "--short", "--no-formatting").Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			msg := strings.TrimSpace(string(exit.Stderr))
+			// Zellij exits 1 saying so when it has no sessions, as it does for a failure
+			if strings.Contains(msg, "No active zellij sessions found") {
+				return false, nil
+			}
+			if msg != "" {
+				err = errors.New(msg)
+			}
+		}
+		return false, fmt.Errorf("can't list Zellij sessions: %w", err)
+	}
+	return slices.Contains(lines(string(out)), name), nil
+}
+
+// zellijCreate creates the session with command in its first tab, in the worktree at path, and shows it:
+// attaching to it as it's created, or, inside Zellij, creating it in the background to switch to it. Zellij
+// has no way to create a session only when there's none: one created since zellijOpen looked is attached to
+// as it is, and the command isn't run.
+func zellijCreate(session, path, command string, inside bool) error {
+	if !inside {
+		return zellijTerminal(path, "attach", "--create", session, "--", "/bin/sh", "-c", command).Run()
+	}
+	cmd := exec.Command("zellij", "attach", "--create-background", session, "--", "/bin/sh", "-c", command)
+	cmd.Dir = path
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return zellijFailure(out, err)
+	}
+	return zellijSwitch(session, path)
+}
+
+// zellijClientWait is how long to wait for a client to connect to a session: the one attaching or switching
+// takes milliseconds, and Zellij a few seconds at most to bring an exited session back.
+var zellijClientWait = 10 * time.Second
+
+const zellijPoll = 50 * time.Millisecond
+
+// zellijTab opens a tab running command, in the worktree at path, in the session. It waits for a client to
+// be connected to the session first, to show the tab and to size it, until ended (if not nil) is closed by
+// the attach meant to connect it. Opening the tab is never retried: a failure may come after the command
+// started.
+func zellijTab(session, path, command string, ended <-chan struct{}) error {
+	deadline := time.Now().Add(zellijClientWait)
+	for last := false; !zellijHasClient(session); {
+		if last {
+			return fmt.Errorf("attaching to session %s ended with no client connected to it: the command wasn't started", session)
+		}
+		select {
+		case <-ended:
+			// one more look at the clients, since the attach may have ended after one connected
+			last = true
+		case <-time.After(zellijPoll):
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no client connected to session %s in %s: the command wasn't started", session, zellijClientWait)
+		}
+	}
+	out, err := exec.Command("zellij", "--session", session, "action", "new-tab", "--cwd", path, "--", "/bin/sh", "-c", command).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("can't open a tab in session %s: %w", session, zellijFailure(out, err))
+	}
+	return nil
+}
+
+// zellijHasClient tells whether a client is connected to the session: zellij lists them under a header.
+func zellijHasClient(session string) bool {
+	out, err := exec.Command("zellij", "--session", session, "action", "list-clients").Output()
+	return err == nil && len(lines(string(out))) > 1
 }
 
 // Rex
@@ -335,8 +513,9 @@ func rexCheck() error {
 }
 
 // rexOpen shows the worktree's Rex session (one per worktree), creating it in the worktree when there's
-// none. Sessions are found by their exact label, so a renamed one is no longer reused.
-func rexOpen(path, branch string) error {
+// none. Sessions are found by their exact label, so a renamed one is no longer reused. A command runs in a
+// new window of the session, shown, or in the first window of the session it creates.
+func rexOpen(path, branch, command string) error {
 	path, err := canonical(path)
 	if err != nil {
 		return err
@@ -346,15 +525,23 @@ func rexOpen(path, branch string) error {
 	if err != nil {
 		return err
 	}
+	if len(ids) == 1 && command != "" {
+		return rexOpenWindow(ids[0], path, command)
+	}
 	if len(ids) == 0 {
-		out, err := exec.Command("rex", "new", label, "-c", path, "--json").CombinedOutput()
+		args := []string{"new", label, "-c", path, "--json"}
+		if command != "" {
+			args = append(args, "--", "/bin/sh", "-c", command)
+		}
+		out, err := exec.Command("rex", args...).CombinedOutput()
 		var created struct {
 			SessionID string `json:"session_id"`
 		}
 		if err == nil && json.Unmarshal(out, &created) == nil && created.SessionID != "" {
 			ids = []string{created.SessionID}
 		} else {
-			// rex new may have created the session even though it failed or timed out: look again rather than retry
+			// rex new may have created the session, and started its command, even though it failed or timed
+			// out: look again rather than retry
 			if ids, err = rexSessions(label); err != nil {
 				return err
 			}
@@ -369,8 +556,33 @@ func rexOpen(path, branch string) error {
 	if len(ids) > 1 {
 		return fmt.Errorf("several sessions are labelled %s: %s", label, strings.Join(ids, ", "))
 	}
-	if out, err := exec.Command("rex", "do", "session.select", "session_id="+ids[0]).CombinedOutput(); err != nil {
-		return fmt.Errorf("can't show session %s: %s", ids[0], strings.TrimRight(string(out), "\n"))
+	return rexSelect(ids[0], "")
+}
+
+// rexOpenWindow runs command in a new window of the session, in the worktree at path, and shows it. A
+// failed or unreadable rex window new may still have started the command, so it's never retried.
+func rexOpenWindow(id, path, command string) error {
+	out, err := exec.Command("rex", "window", "new", "-s", id, "-c", path, "--json", "--", "/bin/sh", "-c", command).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("can't open window in session %s: %s", id, strings.TrimRight(string(out), "\n"))
+	}
+	var window struct {
+		WindowID string `json:"window_id"`
+	}
+	if json.Unmarshal(out, &window) != nil || window.WindowID == "" {
+		return fmt.Errorf("can't read rex window new response for session %s: invalid JSON or missing window_id", id)
+	}
+	return rexSelect(id, window.WindowID)
+}
+
+// rexSelect shows the session in the Rex app, at windowID when it's not empty.
+func rexSelect(sessionID, windowID string) error {
+	args := []string{"do", "session.select", "session_id=" + sessionID}
+	if windowID != "" {
+		args = append(args, "window_id="+windowID)
+	}
+	if out, err := exec.Command("rex", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("can't show session %s: %s", sessionID, strings.TrimRight(string(out), "\n"))
 	}
 	return nil
 }
@@ -415,14 +627,16 @@ func commandCheck() error {
 }
 
 // commandOpen runs WT_OPEN_COMMAND with sh, in the worktree and in wt's terminal. The worktree comes in
-// WT_WORKTREE, WT_BRANCH and WT_SESSION rather than in the command's text, so that no branch name can change
-// what it runs. The command reports its own errors; wt adds how it ended.
-func commandOpen(path, branch string) error {
+// WT_WORKTREE, WT_BRANCH and WT_SESSION, and the command to run in it, a shell snippet, in WT_COMMAND (empty
+// to open a shell, and set then too, so that none inherited is taken for it), rather than in the command's
+// text, so that no branch name or command can change what it runs. The command reports its own errors; wt
+// adds how it ended.
+func commandOpen(path, branch, command string) error {
 	dir, err := canonical(path)
 	if err == nil {
 		cmd := exec.Command("sh", "-c", os.Getenv("WT_OPEN_COMMAND"))
 		cmd.Dir = dir
-		cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+dir, "WT_BRANCH="+branch, "WT_SESSION="+sessionLabel(dir, branch, rexLabelSize))
+		cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+dir, "WT_BRANCH="+branch, "WT_SESSION="+sessionLabel(dir, branch, rexLabelSize), "WT_COMMAND="+command)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		err = cmd.Run()
 	}

@@ -97,13 +97,25 @@ Multiplexer (WT_MULTIPLEXER=auto | tmux | zellij | rex | command):
   tmux     One session per branch, named after it; the same branch in two repositories shares one.
   zellij   One session per worktree, labelled <repo>-<branch>-<path hash> cut to at most 24 bytes, fewer
            when Zellij's socket folder is long, so the socket path fits; a renamed session is no longer
-           reused. Switching sessions from inside Zellij needs zellij 0.44 or later.
+           reused. Switching sessions from inside Zellij, and opening a command (even outside Zellij), need
+           zellij 0.44 or later; a session created for a command has it in its first tab from 0.45.1, and
+           a shell tab first before.
   rex      Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
            labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
            REX_CLIENT picks the Rex app when several are connected.
   command  Runs WT_OPEN_COMMAND with sh, in the worktree and wt's terminal, with WT_WORKTREE (its path),
-           WT_BRANCH and WT_SESSION (a <repo>-<branch>-<path hash> label) set. Never picked by auto.
+           WT_BRANCH, WT_SESSION (a <repo>-<branch>-<path hash> label) and WT_COMMAND (the command to run
+           there, empty to open a shell) set. Never picked by auto.
   Deleting a worktree leaves its session running, and a worktree recreated at the same path reuses it.
+
+Commands ($XDG_CONFIG_HOME/wt/config.json, or ~/.config/wt/config.json):
+  {"default_command": "claude", "keymaps": {"ctrl-a": "claude", "ctrl-o": "opencode"}}
+  Enter opens the picked worktree with default_command, and a key in keymaps (an fzf key name) with its
+  command, in the pickers of wt, wt issue and wt pr; wt clone opens with default_command. In tmux, Zellij
+  and Rex a command runs with /bin/sh -c in the worktree, in a new window (in Zellij, tab) of the
+  worktree's session, or in the first window of a new one; with no command, wt opens a shell, reusing the
+  session. WT_MULTIPLEXER=command passes it in WT_COMMAND. Enter, Esc, Ctrl-C, Ctrl-G, Ctrl-X and Ctrl-T
+  can't be mapped.
 `
 
 // wtError reports an error on stderr and tmux's status line, since the popup closes as soon as wt exits.
