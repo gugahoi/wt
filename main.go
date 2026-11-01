@@ -116,6 +116,14 @@ Commands ($XDG_CONFIG_HOME/wt/config.json, or ~/.config/wt/config.json):
   worktree's session, or in the first window of a new one; with no command, wt opens a shell, reusing the
   session. WT_MULTIPLEXER=command passes it in WT_COMMAND. Enter, Esc, Ctrl-C, Ctrl-G, Ctrl-X and Ctrl-T
   can't be mapped.
+
+Setup (git config wt.setupCommand):
+  git config wt.setupCommand 'pnpm install' sets a command wt runs in every worktree of the repository it
+  creates (wt, wt issue and wt pr), before opening it; --global sets it for every repository, wt clone
+  included, and an empty value in a repository turns a global one off. It runs with /bin/sh -c in the
+  worktree and wt's terminal, with WT_WORKTREE and WT_BRANCH set. When it fails, wt reports it and keeps
+  the worktree unopened; a worktree that exists already isn't set up again. On a pull request's branch,
+  an install command runs that branch's install scripts.
 `
 
 // wtError reports an error on stderr and tmux's status line, since the popup closes as soon as wt exits.

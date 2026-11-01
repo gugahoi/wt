@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -196,6 +198,9 @@ func switchToBranch(picked, command string) error {
 		if err := addWorktree(path, branch, remoteRef); err != nil {
 			return err
 		}
+		if err := setUpWorktree(path, branch); err != nil {
+			return err
+		}
 	}
 	return muxOpenWorktree(path, branch, command)
 }
@@ -238,6 +243,35 @@ func addWorktree(path, branch, remoteRef string) error {
 		start = base
 	}
 	return gitRun("worktree", "add", "--no-track", "-b", branch, path, start)
+}
+
+// setUpWorktree runs the repository's wt.setupCommand, a shell snippet, in the worktree wt has just created
+// at path, on branch, and in wt's terminal, before the worktree opens. git config picks the value: the
+// repository's over the user's global one, so an empty one in the repository turns a global one off. The
+// worktree comes in WT_WORKTREE and WT_BRANCH. When the command fails the worktree stays, unopened.
+func setUpWorktree(path, branch string) error {
+	setup, err := gitOutput("-C", path, "config", "--get", "wt.setupCommand")
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return nil // unset: git config says nothing, it only exits with 1
+	}
+	if err != nil {
+		wtError(fmt.Sprintf("worktree ready at %s; can't read wt.setupCommand: %v", path, err))
+		return errReported
+	}
+	if strings.TrimSpace(setup) == "" {
+		return nil
+	}
+	fmt.Printf("Running wt.setupCommand in '%s'...\n", path)
+	cmd := exec.Command("/bin/sh", "-c", setup)
+	cmd.Dir = path
+	cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+path, "WT_BRANCH="+branch)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		wtError(fmt.Sprintf("worktree ready at %s; wt.setupCommand failed: %v", path, err))
+		return errReported
+	}
+	return nil
 }
 
 // cmdClone clones a repository as bare, into <dir>/.bare, and opens a worktree of its default branch.
@@ -289,7 +323,11 @@ func cmdClone(url, dir string) error {
 	if err := gitRun("-C", dir, "worktree", "add", branch); err != nil {
 		return err
 	}
-	return muxOpenWorktree(filepath.Join(dir, branch), branch, cfg.DefaultCommand)
+	path := filepath.Join(dir, branch)
+	if err := setUpWorktree(path, branch); err != nil {
+		return err
+	}
+	return muxOpenWorktree(path, branch, cfg.DefaultCommand)
 }
 
 // repoName is the name a clone of url gets: its last path component, without .git.

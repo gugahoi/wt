@@ -2429,3 +2429,63 @@ func TestCommandRexFailures(t *testing.T) {
 		})
 	}
 }
+
+// Setup command
+
+// setupLogged is a wt.setupCommand that logs, among the stubs' calls, the worktree and branch it's given and
+// the folder it runs in.
+const setupLogged = `printf '["setup","%s","%s","%s"]\n' "$WT_WORKTREE" "$WT_BRANCH" "$(pwd -P)" >> "$WT_STUB_DIR/calls"`
+
+func TestSetupCommandRunsOnceWhenTheWorktreeIsCreated(t *testing.T) {
+	f := setup(t)
+	f.git("config", "wt.setupCommand", setupLogged)
+	path := f.switchFeature()
+	open := []string{"tmux", "new-session", "-A", "-s", "feature_x_y", "-c", path}
+	checkCalls(t, f.calls(), [][]string{{"setup", path, "feature/x.y", path}, open})
+	// Switching to it again opens it as it is.
+	f.clearCalls()
+	if err := switchToBranch("feature/x.y [wt]", ""); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.calls(), [][]string{open})
+}
+
+func TestSetupCommandFailureKeepsWorktreeUnopened(t *testing.T) {
+	f := setup(t)
+	f.git("config", "wt.setupCommand", "exit 3")
+	f.git("branch", "feature/x.y")
+	if switchToBranch("feature/x.y", "") == nil {
+		t.Fatal("succeeded")
+	}
+	worktree := filepath.Join(f.repo, "feature/x.y")
+	if want := "wt: worktree ready at " + worktree + "; wt.setupCommand failed: exit status 3"; !strings.Contains(f.stderr.String(), want) {
+		t.Errorf("stderr %q", f.stderr.String())
+	}
+	if !isWorktree(worktree) {
+		t.Error("worktree removed")
+	}
+	checkCalls(t, f.calls(), nil)
+}
+
+func TestSetupCommandGlobalAndRepositoryValues(t *testing.T) {
+	f := setup(t)
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(f.root, "gitconfig"))
+	f.git("config", "--global", "wt.setupCommand", "touch set-up")
+	// The global value sets up every repository's new worktrees, the first one wt clone makes included.
+	if path := f.clone(); !exists(filepath.Join(path, "set-up")) {
+		t.Error("cloned worktree not set up")
+	}
+	t.Chdir(f.repo)
+	if path := f.switchFeature(); !exists(filepath.Join(path, "set-up")) {
+		t.Error("worktree not set up")
+	}
+	// An empty value in the repository turns the global one off.
+	f.git("config", "wt.setupCommand", "")
+	f.git("branch", "other")
+	if err := switchToBranch("other", ""); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if exists(filepath.Join(f.repo, "other", "set-up")) {
+		t.Error("set up despite the repository's empty value")
+	}
+}
