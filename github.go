@@ -310,6 +310,8 @@ func refresh(kind string) error {
 // issueLines lists the cached issues for fzf as "issue<TAB>number<TAB>updatedAt<TAB>display<TAB>tags",
 // tagging those with a <number>-* branch [wt] or [br]. Displays are padded to 300 columns, so they always
 // overflow the list and --freeze-right keeps the tags showing at the edge, cutting the title instead.
+// Even unmarked issues need a non-whitespace tag: fzf strips trailing whitespace before freezing fields,
+// which otherwise freezes the entire title and clips its beginning on long rows.
 func issueLines() []string {
 	rows := readCache("issues")
 	if rows == nil {
@@ -334,7 +336,11 @@ func issueLines() []string {
 		if f[3] != "" {
 			display += "  \033[2m[" + f[3] + "]\033[0m"
 		}
-		out[i] = fmt.Sprintf("issue\t%s\t%s\t%-300s\t  %s", f[0], f[1], display, mark[f[0]])
+		tag := mark[f[0]]
+		if tag == "" {
+			tag = "\033[2m·\033[0m"
+		}
+		out[i] = fmt.Sprintf("issue\t%s\t%s\t%-300s\t  %s", f[0], f[1], display, tag)
 	}
 	return out
 }
@@ -457,7 +463,7 @@ func cmdGitHub(kind string) error {
 	wt := shellQuote(self())
 	picked, command, err := pickLaunch(cmdLines([]string{kind}), cfg, cfg.DefaultCommand, false, "--ansi",
 		"--prompt="+prompt, "--header="+pickerHeader(kind),
-		"--delimiter=\t", "--with-nth=4..", "--freeze-right=1", "--ellipsis=",
+		"--delimiter=\t", "--with-nth=4..", "--freeze-right=1", "--no-wrap", "--no-keep-right", "--ellipsis=",
 		"--bind=load:unbind(load)+reload-sync("+wt+" --lines --refresh)",
 		"--bind=ctrl-t:transform("+wt+" --toggle)",
 		"--preview="+wt+" --preview {1} {2} {3}", "--preview-window=right,50%,wrap")
