@@ -89,10 +89,10 @@ export WT_OPEN_COMMAND='kitten @ launch --type=tab --tab-title "$WT_BRANCH" --cw
 
 ### Setting up in the background
 
-wt waits for `wt.setupCommand` to finish before it opens the worktree, but only for its `sh -c` to exit, so a command that puts the setup in the background lets the worktree open straight away. `nohup` keeps the setup running when wt's terminal closes, as a tmux popup does when wt exits. Its output goes to a log in the worktree's git folder, where it isn't an untracked file:
+wt waits for `wt.setupCommand` to finish before it opens the worktree, but only for its `sh -c` to exit, so a command that puts the setup in the background lets the worktree open straight away. `set -m` starts it in a process group of its own, which keeps it running when wt's terminal closes, as a tmux popup does when wt exits; `nohup` doesn't, for Node tools such as pnpm, which undo it. Its input is `/dev/null`, so that it never stops waiting on the terminal, and its output goes to a log in the worktree's git folder, where it isn't an untracked file:
 
 ```sh
-git config wt.setupCommand 'nohup pnpm install > "$(git rev-parse --git-dir)/wt-setup.log" 2>&1 &'
+git config wt.setupCommand 'set -m; pnpm install </dev/null > "$(git rev-parse --git-dir)/wt-setup.log" 2>&1 &'
 
 # what it printed, from the worktree
 cat "$(git rev-parse --git-dir)/wt-setup.log"
