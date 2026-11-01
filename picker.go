@@ -16,9 +16,7 @@ import (
 var pick = runFzf
 
 func runFzf(input []string, args ...string) ([]string, int) {
-	// fzf would open a tmux or Zellij popup (--popup/--tmux in FZF_DEFAULT_OPTS) by running the program's own
-	// command line again, which is wt's rather than fzf's when fzf is a library: keep it in this terminal.
-	opts, err := fzf.ParseOptions(true, append(args, "--no-popup"))
+	opts, err := fzfOptions(args)
 	if err != nil {
 		wtError("fzf: " + err.Error())
 		return nil, fzf.ExitError
@@ -47,13 +45,29 @@ func runFzf(input []string, args ...string) ([]string, int) {
 	return out, code
 }
 
+// fzfOptions parses args over the user's FZF_DEFAULT_OPTS, for a picker shown in this terminal.
+func fzfOptions(args []string) (*fzf.Options, error) {
+	// fzf would open a tmux or Zellij popup (--popup/--tmux in FZF_DEFAULT_OPTS) by running the program's own
+	// command line again, which is wt's rather than fzf's when fzf is a library: keep it in this terminal.
+	opts, err := fzf.ParseOptions(true, append(args, "--no-popup"))
+	if err != nil {
+		return nil, err
+	}
+	// --filter would make fzf print the matches without showing a picker or the key pressed, and no option
+	// undoes it.
+	opts.Filter = nil
+	return opts, nil
+}
+
 // pickLaunch shows a picker for a worktree to open, and returns the row picked along with the command to
 // open it with: command for Enter (or a mouse accept), or the one cfg maps the key pressed instead to.
 // allowQuery lets a query that matches nothing be picked, naming a new branch. The keys are fzf --expect
 // keys rather than bindings, so commands never become part of fzf's action syntax.
 func pickLaunch(input []string, cfg commandConfig, command string, allowQuery bool, args ...string) (string, string, error) {
 	keys := slices.Sorted(maps.Keys(cfg.Keymaps))
-	args = append(slices.Clip(args), "--no-multi", "--print-query", "--no-expect", "--expect=enter")
+	// Multi-selection and --expect keys in FZF_DEFAULT_OPTS would change what fzf prints, and --exit-0 would
+	// skip a picker with nothing to match, like the one naming a new branch, taking its query as the answer.
+	args = append(slices.Clip(args), "--no-multi", "--no-exit-0", "--print-query", "--no-expect", "--expect=enter")
 	for _, key := range keys {
 		args = append(args, "--expect="+key)
 	}
@@ -78,7 +92,8 @@ func pickLaunch(input []string, cfg commandConfig, command string, allowQuery bo
 	default:
 		return "", "", errReported
 	}
-	// fzf prints the query, the key pressed, then the row picked (none when nothing matches the query).
+	// fzf prints the query, the key pressed, whatever print actions in FZF_DEFAULT_OPTS queued, then the row
+	// picked, and only then exits ok: when nothing matches the query there's no row, only print output.
 	if len(out) == 0 {
 		return "", "", nil
 	}
@@ -93,8 +108,8 @@ func pickLaunch(input []string, cfg commandConfig, command string, allowQuery bo
 		command = mapped
 	}
 	picked := ""
-	if len(out) > 2 {
-		picked = out[2]
+	if code == fzf.ExitOk && len(out) > 2 {
+		picked = out[len(out)-1]
 	}
 	if picked == "" && allowQuery {
 		picked = out[0]

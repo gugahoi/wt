@@ -1580,6 +1580,12 @@ func TestCommandSelection(t *testing.T) {
 		{"a key picks its command", []string{"query", "ctrl-o", row}, fzf.ExitOk, false, row, "opencode", ""},
 		{"new branch typed", []string{"new-topic", "ctrl-o"}, fzf.ExitNoMatch, true, "new-topic", "opencode", ""},
 		{"query matching no issue", []string{"new-topic", "ctrl-o"}, fzf.ExitNoMatch, false, "", "", ""},
+		// Print actions in FZF_DEFAULT_OPTS, like --bind=start:print(main), print between the key and the row.
+		{"print before the row", []string{"query", "enter", "main", row}, fzf.ExitOk, false, row, "claude", ""},
+		{"print before the row of a key", []string{"query", "ctrl-o", "main", "other", row}, fzf.ExitOk, false, row, "opencode", ""},
+		{"print before the row of a mouse accept", []string{"query", "", "ctrl-y", row}, fzf.ExitOk, true, row, "claude", ""},
+		{"print with new branch typed", []string{"new-topic", "enter", "main"}, fzf.ExitNoMatch, true, "new-topic", "claude", ""},
+		{"print with query matching no issue", []string{"new-topic", "ctrl-o", "main"}, fzf.ExitNoMatch, false, "", "", ""},
 		{"empty query", []string{"", "enter"}, fzf.ExitNoMatch, true, "", "", ""},
 		{"cancelled", []string{"query", "ctrl-o", row}, fzf.ExitInterrupt, true, "", "", ""},
 		{"cancelled without output", nil, fzf.ExitInterrupt, true, "", "", ""},
@@ -1604,6 +1610,32 @@ func TestCommandSelection(t *testing.T) {
 				t.Errorf("got %q, %q, %v", picked, command, err)
 			}
 		})
+	}
+}
+
+// A picker is always shown: --exit-0 in FZF_DEFAULT_OPTS would skip one with nothing to match, like the one
+// naming a new branch, and --filter would print matches without showing any. What fzf runs with is checked
+// rather than run, as an interactive fzf needs a terminal.
+func TestPickersShownDespiteDefaultOptions(t *testing.T) {
+	setup(t)
+	t.Setenv("FZF_DEFAULT_OPTS", "--exit-0 --filter=topic")
+	t.Setenv("FZF_DEFAULT_OPTS_FILE", "")
+	var opts *fzf.Options
+	pick = func(_ []string, args ...string) ([]string, int) {
+		var err error
+		if opts, err = fzfOptions(args); err != nil {
+			t.Fatal(err)
+		}
+		return nil, fzf.ExitInterrupt
+	}
+	if _, _, err := pickLaunch(nil, commandConfig{}, "claude", true, "--prompt=New branch> ", "--query=5-issue"); err != nil {
+		t.Fatal(err)
+	}
+	if opts == nil {
+		t.Fatal("no picker shown")
+	}
+	if opts.Exit0 || opts.Filter != nil {
+		t.Errorf("exit-0 %t, filter mode %t", opts.Exit0, opts.Filter != nil)
 	}
 }
 
