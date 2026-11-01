@@ -43,6 +43,14 @@ Multiplexer (WT_MULTIPLEXER=auto | tmux | rex):
         labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
         REX_CLIENT picks the Rex app when several are connected.
   Deleting a worktree leaves its session running, and a worktree recreated at the same path reuses it.
+
+Commands ($XDG_CONFIG_HOME/wt/config.json, or ~/.config/wt/config.json):
+  {"default_command": "claude", "keymaps": {"ctrl-a": "claude", "ctrl-o": "opencode"}}
+  Enter opens the picked worktree with default_command, and a key in keymaps (an fzf key name) with its
+  command, in the pickers of wt, wt issue and wt pr; wt clone opens with default_command. A command runs
+  with /bin/sh -c in the worktree, in a new window of the worktree's session, or in the first window of a
+  new one; with no command, wt opens a shell, reusing the session. Enter, Esc, Ctrl-C, Ctrl-G, Ctrl-X and
+  Ctrl-T can't be mapped.
 ```
 
 ## Development

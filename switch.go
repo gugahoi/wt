@@ -107,25 +107,31 @@ func header() string {
 	return b.String()
 }
 
-// cmdSwitch lists all branches and switches to the one picked, or to the new branch typed in.
+// cmdSwitch lists all branches and switches to the one picked, or to the new branch typed in, with the
+// command the key pressed picks.
 func cmdSwitch() error {
 	if err := muxSetting(); err != nil {
 		return err
 	}
-	branch, err := pickBranch()
+	cfg, err := loadCommandConfig()
 	if err != nil {
 		return err
 	}
-	return switchToBranch(branch)
+	branch, command, err := pickBranch(cfg)
+	if err != nil {
+		return err
+	}
+	return switchToBranch(branch, command)
 }
 
-// pickBranch shows the branch picker. Ctrl-X starts a background deletion and returns straight away, so
-// several deletions can run at once. The picker registers its fzf --listen socket so finished deletions can
-// make it reload, and its header is refreshed after every (re)load.
-func pickBranch() (string, error) {
+// pickBranch shows the branch picker, returning the branch picked (or the new one typed in) and the
+// command to open it with. Ctrl-X starts a background deletion and returns straight away, so several
+// deletions can run at once. The picker registers its fzf --listen socket so finished deletions can make it
+// reload, and its header is refreshed after every (re)load.
+func pickBranch(cfg commandConfig) (string, string, error) {
 	sockDir, err := os.MkdirTemp("", "wt.")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer os.RemoveAll(sockDir)
 	sock := filepath.Join(sockDir, "fzf.sock")
@@ -136,24 +142,16 @@ func pickBranch() (string, error) {
 		}
 	}
 	wt := shellQuote(self())
-	out, _ := pick(listBranches(), "--ansi", "--print-query", "--prompt=Branch> ", "--listen="+sock,
+	return pickLaunch(listBranches(), cfg, cfg.DefaultCommand, true, "--ansi", "--prompt=Branch> ", "--listen="+sock,
 		"--header="+header(), "--delimiter=\t", "--with-nth=1,2",
 		"--bind=ctrl-x:execute("+wt+" --delete-selected {3} {1})+reload-sync("+wt+" --list-branches)",
 		"--bind=load:transform-header("+wt+" --header)")
-	// The query comes first: it names a new branch when nothing was picked.
-	if len(out) == 0 {
-		return "", nil
-	}
-	if picked := out[len(out)-1]; len(out) > 1 && picked != "" {
-		return picked, nil
-	}
-	return out[0], nil
 }
 
 // switchToBranch takes a branch picked in fzf (possibly tagged [wt] or deleting, with the picker's other
 // fields) and switches to its multiplexer session, creating the worktree - and the branch, off a freshly
-// fetched origin/<default> - when missing.
-func switchToBranch(picked string) error {
+// fetched origin/<default> - when missing. A command opens in a new window of the session.
+func switchToBranch(picked, command string) error {
 	branch, fields, _ := strings.Cut(picked, "\t")
 	// The hidden ref identifies remote-only selections, including non-origin remotes.
 	remoteRef := ""
@@ -199,7 +197,7 @@ func switchToBranch(picked string) error {
 			return err
 		}
 	}
-	return muxOpenWorktree(path, branch)
+	return muxOpenWorktree(path, branch, command)
 }
 
 func isWorktree(path string) bool {
@@ -255,6 +253,10 @@ func cmdClone(url, dir string) error {
 		fmt.Fprintf(errOut, "Error: Target directory '%s' already exists.\n", dir)
 		return errReported
 	}
+	cfg, err := loadCommandConfig()
+	if err != nil {
+		return err
+	}
 	if err := muxPreflight(); err != nil {
 		return err
 	}
@@ -263,7 +265,7 @@ func cmdClone(url, dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	dir, err := filepath.Abs(dir)
+	dir, err = filepath.Abs(dir)
 	if err == nil {
 		dir, err = filepath.EvalSymlinks(dir)
 	}
@@ -287,7 +289,7 @@ func cmdClone(url, dir string) error {
 	if err := gitRun("-C", dir, "worktree", "add", branch); err != nil {
 		return err
 	}
-	return muxOpenWorktree(filepath.Join(dir, branch), branch)
+	return muxOpenWorktree(filepath.Join(dir, branch), branch, cfg.DefaultCommand)
 }
 
 // repoName is the name a clone of url gets: its last path component, without .git.

@@ -427,10 +427,15 @@ func toggleActions() string {
 }
 
 // cmdGitHub lists the repo's open GitHub issues or PRs, Ctrl-T switching between them, and opens the picked
-// one. The cached list shows straight away and is swapped for a fresh one once GitHub answers (load is
-// unbound first so the reload doesn't retrigger it); only a first run waits on GitHub.
+// one with the command the key pressed picks. The cached list shows straight away and is swapped for a fresh
+// one once GitHub answers (load is unbound first so the reload doesn't retrigger it); only a first run waits
+// on GitHub.
 func cmdGitHub(kind string) error {
 	if err := muxSetting(); err != nil {
+		return err
+	}
+	cfg, err := loadCommandConfig()
+	if err != nil {
 		return err
 	}
 	prompt := "Issue> "
@@ -450,30 +455,31 @@ func cmdGitHub(kind string) error {
 		}
 	}
 	wt := shellQuote(self())
-	out, _ := pick(cmdLines([]string{kind}), "--ansi", "--prompt="+prompt, "--header="+pickerHeader(kind),
+	picked, command, err := pickLaunch(cmdLines([]string{kind}), cfg, cfg.DefaultCommand, false, "--ansi",
+		"--prompt="+prompt, "--header="+pickerHeader(kind),
 		"--delimiter=\t", "--with-nth=4..", "--freeze-right=1", "--ellipsis=",
 		"--bind=load:unbind(load)+reload-sync("+wt+" --lines --refresh)",
 		"--bind=ctrl-t:transform("+wt+" --toggle)",
 		"--preview="+wt+" --preview {1} {2} {3}", "--preview-window=right,50%,wrap")
-	if len(out) == 0 || out[0] == "" {
-		return nil
+	if err != nil || picked == "" {
+		return err
 	}
-	f := strings.Split(out[0], "\t")
+	f := strings.Split(picked, "\t")
 	if len(f) < 2 {
 		return nil
 	}
 	switch f[0] {
 	case "issue":
-		return openIssue(f[1])
+		return openIssue(f[1], cfg, command)
 	case "pr":
-		return openPR(f[1])
+		return openPR(f[1], command)
 	}
 	return nil
 }
 
 // openIssue offers the issue's existing <number>-* branches or a new one named in an editable prompt, and
-// switches to it.
-func openIssue(n string) error {
+// switches to it with command, unless a key pressed in either picker picks another.
+func openIssue(n string, cfg commandConfig, command string) error {
 	const newBranch = "+ new branch"
 	branch := newBranch
 	var matches []string
@@ -483,12 +489,12 @@ func openIssue(n string) error {
 		}
 	}
 	if len(matches) > 0 {
-		out, code := pick(append([]string{newBranch}, matches...), "--ansi", "--no-sort", "--delimiter=\t",
-			"--with-nth=1,2", "--prompt=#"+n+"> ")
-		if code != 0 || len(out) == 0 {
-			return nil
+		picked, picker, err := pickLaunch(append([]string{newBranch}, matches...), cfg, command, false, "--ansi",
+			"--no-sort", "--delimiter=\t", "--with-nth=1,2", "--prompt=#"+n+"> ")
+		if err != nil || picked == "" {
+			return err
 		}
-		branch = out[0]
+		branch, command = picked, picker
 	}
 	if branch == newBranch {
 		title := ""
@@ -498,16 +504,16 @@ func openIssue(n string) error {
 				break
 			}
 		}
-		out, code := pick(nil, "--prompt=New branch> ", "--info=hidden", "--query="+n+"-"+slug(title),
-			"--bind=enter:print-query")
-		if code != 0 || len(out) == 0 || out[0] == "" {
-			return nil
+		named, picker, err := pickLaunch(nil, cfg, command, true, "--prompt=New branch> ", "--info=hidden",
+			"--query="+n+"-"+slug(title))
+		if err != nil || named == "" {
+			return err
 		}
-		if branch = out[0]; !strings.HasPrefix(branch, n+"-") {
+		if branch, command = named, picker; !strings.HasPrefix(branch, n+"-") {
 			branch = n + "-" + branch
 		}
 	}
-	return switchToBranch(branch)
+	return switchToBranch(branch, command)
 }
 
 // slug turns an issue title into a branch name: its first five lowercase words, joined with dashes.
@@ -527,8 +533,8 @@ func slug(title string) string {
 	return strings.TrimSuffix(strings.Join(words[:min(len(words), 5)], "-"), "-")
 }
 
-// openPR switches to the PR's branch, fetching it from GitHub when there's no local branch yet.
-func openPR(n string) error {
+// openPR switches to the PR's branch, with command, fetching it from GitHub when there's no local branch yet.
+func openPR(n, command string) error {
 	var cross, branch string
 	for _, f := range readCache("prs") {
 		if f[0] == n {
@@ -559,7 +565,7 @@ func openPR(n string) error {
 			return errReported
 		}
 	}
-	return switchToBranch(branch)
+	return switchToBranch(branch, command)
 }
 
 // preview prints an issue or PR the way `gh issue view` / `gh pr view` show it, cached until its updatedAt

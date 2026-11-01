@@ -88,16 +88,17 @@ func rexLive() bool {
 	return err == nil && json.Unmarshal(out, &whoami) == nil && whoami.SessionID != nil
 }
 
-// muxOpenWorktree opens the worktree at path, on branch, in the multiplexer. The worktree stays when that
-// fails; tmux reports its own errors.
-func muxOpenWorktree(path, branch string) error {
+// muxOpenWorktree opens the worktree at path, on branch, in the multiplexer: a shell, reusing the worktree's
+// session, or else command, in a new window of that session (or the first window of a new one). The
+// worktree stays when that fails; tmux reports its own errors.
+func muxOpenWorktree(path, branch, command string) error {
 	if err := muxPreflight(); err != nil {
 		return err
 	}
 	if mux == "tmux" {
-		return tmuxOpen(path, branch)
+		return tmuxOpen(path, branch, command)
 	}
-	if err := rexOpen(path, branch); err != nil {
+	if err := rexOpen(path, branch, command); err != nil {
 		wtError(fmt.Sprintf("worktree ready at %s; Rex session could not be opened: %v", path, err))
 		return errReported
 	}
@@ -106,33 +107,50 @@ func muxOpenWorktree(path, branch string) error {
 
 // tmuxOpen switches to (or, outside tmux, attaches) the tmux session named after the branch, creating it in
 // the worktree. Names don't include the repository, so the same branch in two repositories shares one.
-func tmuxOpen(path, branch string) error {
+// A command runs in a new window of the session, or in the first window of the session it creates.
+func tmuxOpen(path, branch, command string) error {
 	session := strings.NewReplacer("/", "_", ".", "_", ":", "_").Replace(branch)
 	tmux := func(args ...string) error {
 		cmd := exec.Command("tmux", args...)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-		return cmd.Run()
+		if cmd.Run() != nil {
+			return errReported
+		}
+		return nil
+	}
+	inside := os.Getenv("TMUX") != ""
+	window := []string{"-c", path}
+	if command != "" {
+		window = append(window, "/bin/sh", "-c", command)
+	}
+	if command == "" && !inside {
+		return tmux(append([]string{"new-session", "-A", "-s", session}, window...)...)
+	}
+	exists := exec.Command("tmux", "has-session", "-t", "="+session).Run() == nil
+	if !exists && !inside {
+		// Attached as it's created: -A would attach to a session created since the check, without the command.
+		return tmux(append([]string{"new-session", "-s", session}, window...)...)
 	}
 	var err error
-	if os.Getenv("TMUX") != "" {
-		if exec.Command("tmux", "has-session", "-t", "="+session).Run() != nil {
-			err = tmux("new-session", "-d", "-s", session, "-c", path)
-		}
-		if err == nil {
-			err = tmux("switch-client", "-t", "="+session)
-		}
-	} else {
-		err = tmux("new-session", "-A", "-s", session, "-c", path)
+	if !exists {
+		err = tmux(append([]string{"new-session", "-d", "-s", session}, window...)...)
+	} else if command != "" {
+		// The trailing colon picks the session's next free window index.
+		err = tmux(append([]string{"new-window", "-t", "=" + session + ":"}, window...)...)
 	}
 	if err != nil {
-		return errReported
+		return err
 	}
-	return nil
+	if inside {
+		return tmux("switch-client", "-t", "="+session)
+	}
+	return tmux("attach-session", "-t", "="+session)
 }
 
 // rexOpen shows the worktree's Rex session (one per worktree), creating it in the worktree when there's
-// none. Sessions are found by their exact label, so a renamed one is no longer reused.
-func rexOpen(path, branch string) error {
+// none. Sessions are found by their exact label, so a renamed one is no longer reused. A command runs in a
+// new window of the session, shown, or in the first window of the session it creates.
+func rexOpen(path, branch, command string) error {
 	resolved, err := filepath.Abs(path)
 	if err == nil {
 		resolved, err = filepath.EvalSymlinks(resolved)
@@ -146,15 +164,23 @@ func rexOpen(path, branch string) error {
 	if err != nil {
 		return err
 	}
+	if len(ids) == 1 && command != "" {
+		return rexOpenWindow(ids[0], path, command)
+	}
 	if len(ids) == 0 {
-		out, err := exec.Command("rex", "new", label, "-c", path, "--json").CombinedOutput()
+		args := []string{"new", label, "-c", path, "--json"}
+		if command != "" {
+			args = append(args, "--", "/bin/sh", "-c", command)
+		}
+		out, err := exec.Command("rex", args...).CombinedOutput()
 		var created struct {
 			SessionID string `json:"session_id"`
 		}
 		if err == nil && json.Unmarshal(out, &created) == nil && created.SessionID != "" {
 			ids = []string{created.SessionID}
 		} else {
-			// rex new may have created the session even though it failed or timed out: look again rather than retry
+			// rex new may have created the session, and started its command, even though it failed or timed
+			// out: look again rather than retry
 			if ids, err = rexSessions(label); err != nil {
 				return err
 			}
@@ -169,8 +195,30 @@ func rexOpen(path, branch string) error {
 	if len(ids) > 1 {
 		return fmt.Errorf("several sessions are labelled %s: %s", label, strings.Join(ids, ", "))
 	}
-	if out, err := exec.Command("rex", "do", "session.select", "session_id="+ids[0]).CombinedOutput(); err != nil {
-		return fmt.Errorf("can't show session %s: %s", ids[0], strings.TrimRight(string(out), "\n"))
+	return rexSelect(ids[0])
+}
+
+// rexOpenWindow runs command in a new window of the session, in the worktree at path, and shows it. A
+// failed or unreadable rex window new may still have started the command, so it's never retried.
+func rexOpenWindow(id, path, command string) error {
+	out, err := exec.Command("rex", "window", "new", "-s", id, "-c", path, "--json", "--", "/bin/sh", "-c", command).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("can't open window in session %s: %s", id, strings.TrimRight(string(out), "\n"))
+	}
+	var window struct {
+		WindowID string `json:"window_id"`
+	}
+	if json.Unmarshal(out, &window) != nil || window.WindowID == "" {
+		return fmt.Errorf("can't read rex window new response for session %s: invalid JSON or missing window_id", id)
+	}
+	return rexSelect(id, "window_id="+window.WindowID)
+}
+
+// rexSelect shows the session in the Rex app, at the given window_id=<id> when there is one.
+func rexSelect(id string, window ...string) error {
+	args := append([]string{"do", "session.select", "session_id=" + id}, window...)
+	if out, err := exec.Command("rex", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("can't show session %s: %s", id, strings.TrimRight(string(out), "\n"))
 	}
 	return nil
 }
