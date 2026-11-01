@@ -1,0 +1,13 @@
+name: Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jq
+        run: command -v jq >/dev/null || brew install jq
+      - name: Run tests
+        run: python3 -m unittest discover -s tests -p 'test_wt.py'

@@ -1,0 +1,79 @@
+name: Release
+
+# Create a GitHub Release and update the Homebrew formula.
+# Trigger by pushing a version tag, e.g.:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: release
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "${TAG}" =~ ^v[0-9] ]]; then
+            echo "Release tag must start with v, for example v1.0.0." >&2
+            exit 1
+          fi
+          echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
+          echo "version=${TAG#v}" >>"${GITHUB_OUTPUT}"
+
+      - name: Compute tarball sha
+        id: tarball
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SHA256="$(curl -fsSL "https://github.com/gugahoi/wt/archive/refs/tags/${TAG}.tar.gz" | shasum -a 256 | cut -d ' ' -f 1)"
+          echo "sha256=${SHA256}" >>"${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists."
+          else
+            gh release create "${TAG}" --title "${TAG}" --generate-notes
+          fi
+
+      - name: Generate Homebrew tap token
+        id: tap-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.HOMEBREW_TAP_CLIENT_ID }}
+          private-key: ${{ secrets.HOMEBREW_TAP_APP_PRIVATE_KEY }}
+          owner: gugahoi
+          repositories: homebrew-tap
+
+      - name: Update Homebrew formula
+        env:
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+          SHA256: ${{ steps.tarball.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/gugahoi/homebrew-tap.git" homebrew-tap
+          ./scripts/write-formula.sh "${TAG}" "${SHA256}" homebrew-tap/Formula/wt.rb
+          git -C homebrew-tap config user.name "github-actions[bot]"
+          git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C homebrew-tap add Formula/wt.rb
+          if git -C homebrew-tap diff --cached --quiet; then
+            echo "Homebrew formula is already up to date."
+          else
+            git -C homebrew-tap commit -m "Update wt formula to ${TAG}"
+            git -C homebrew-tap push
+          fi

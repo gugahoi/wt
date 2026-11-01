@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / ".local/bin/wt"
+SCRIPT = Path(__file__).resolve().parents[1] / "bin/wt"
 
 # Inherited from the terminal running the tests; they would point wt at a live tmux or Rex.
 SCRUBBED_ENV = ("TMUX", "TMUX_PANE", "REX_SESSION", "REX_BLOCK", "REX_CLIENT", "WT_MULTIPLEXER")
