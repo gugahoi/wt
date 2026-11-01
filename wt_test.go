@@ -103,6 +103,18 @@ func stub(name string, args []string) int {
 		return 0
 	}
 	if name == "zellij" {
+		// zellij --session <name> action ...: the session an action goes to
+		target := ""
+		if args[0] == "--session" {
+			target, args = args[1], args[2:]
+		}
+		// zellij-client names the session the client is showing, which attaching or switching to it sets, unless
+		// zellij-no-client says no client ever connects
+		connect := func(session string) {
+			if _, err := os.Stat(filepath.Join(state, "zellij-no-client")); err != nil {
+				os.WriteFile(filepath.Join(state, "zellij-client"), []byte(session), 0o644)
+			}
+		}
 		switch args[0] {
 		case "--version":
 			version, err := os.ReadFile(filepath.Join(state, "zellij-version"))
@@ -110,12 +122,42 @@ func stub(name string, args []string) int {
 				version = []byte("zellij 0.45.1\n")
 			}
 			os.Stdout.Write(version)
+		case "list-sessions":
+			// zellij-sessions lists them; with none, zellij says so and exits 1, as it does when it fails
+			fail("zellij-list-error", 2)
+			names, _ := os.ReadFile(filepath.Join(state, "zellij-sessions"))
+			if len(names) == 0 {
+				fmt.Fprintln(os.Stderr, "No active zellij sessions found.")
+				return 1
+			}
+			os.Stdout.Write(names)
 		case "attach":
 			dir, _ := os.Getwd()
 			os.WriteFile(filepath.Join(state, "zellij-cwd"), []byte(dir), 0o644)
 			fail("zellij-error", 1)
+			if args[1] != "--create-background" {
+				connect(args[2])
+			}
 		case "action":
 			fail("zellij-error", 1)
+			client, _ := os.ReadFile(filepath.Join(state, "zellij-client"))
+			switch args[1] {
+			case "switch-session":
+				connect(args[2])
+			case "list-clients":
+				fmt.Println("CLIENT_ID ZELLIJ_PANE_ID RUNNING_COMMAND")
+				if string(client) == target {
+					fmt.Println("1         terminal_0     N/A")
+				}
+			case "new-tab":
+				// a tab needs a client to show it, and to size it
+				if string(client) != target {
+					fmt.Fprintln(os.Stderr, "Failed to apply layout: Not enough room for panes")
+					return 1
+				}
+				fail("zellij-tab-error", 1)
+				fmt.Println(1)
+			}
 		}
 		return 0
 	}
@@ -1266,6 +1308,178 @@ func TestZellijVersionCheck(t *testing.T) {
 	}
 }
 
+// zellijCalls are the calls to zellij but for those polling for a client, which vary in number.
+func zellijCalls(f *fixture) [][]string {
+	return slices.DeleteFunc(f.calls(), func(call []string) bool { return slices.Contains(call, "list-clients") })
+}
+
+// zellijCommand is a command to open: it holds what a shell would act on, or split at.
+const zellijCommand = "echo \"$(touch pwned)\" 'a b'; \\; exit\n# end"
+
+func TestZellijCommand(t *testing.T) {
+	version := []string{"zellij", "--version"}
+	list := []string{"zellij", "list-sessions", "--short", "--no-formatting"}
+	tab := func(worktree, session string) []string {
+		return []string{"zellij", "--session", session, "action", "new-tab", "--cwd", worktree, "--", "/bin/sh", "-c", zellijCommand}
+	}
+	switchTo := func(worktree, session string) []string {
+		return []string{"zellij", "action", "switch-session", session, "--cwd", worktree}
+	}
+	attach := func(worktree, session string) []string {
+		return []string{"zellij", "attach", "--create", session, "options", "--default-cwd", worktree}
+	}
+	for _, c := range []struct {
+		name     string
+		env      map[string]string
+		version  string
+		sessions string // what zellij lists, with the worktree's session when exists; nothing is no sessions at all
+		exists   bool
+		want     func(worktree, session string) [][]string
+	}{
+		// The session is shown, then a tab opens in it for the command
+		{"inside, existing session", inZellij, "zellij 0.45.1", "other\n", true, func(w, s string) [][]string {
+			return [][]string{version, version, list, switchTo(w, s), tab(w, s)}
+		}},
+		{"outside, existing session", nil, "zellij 0.45.1", "other\n", true, func(w, s string) [][]string {
+			return [][]string{version, list, attach(w, s), tab(w, s)}
+		}},
+		// Before 0.45.1 a session can't start with a command: it has its shell tab, and then the command's
+		{"inside, zellij 0.44.0", inZellij, "zellij 0.44.0", "other\n", false, func(w, s string) [][]string {
+			return [][]string{version, version, switchTo(w, s), tab(w, s)}
+		}},
+		{"outside, zellij 0.44.0", nil, "zellij 0.44.0", "", false, func(w, s string) [][]string {
+			return [][]string{version, attach(w, s), tab(w, s)}
+		}},
+		// The command runs in the first tab of a new session, which is not one that only starts with the label
+		{"inside, new session", inZellij, "zellij 0.45.1", "other\n" + "label-and-more\n", false, func(w, s string) [][]string {
+			return [][]string{version, version, list,
+				{"zellij", "attach", "--create-background", s, "--", "/bin/sh", "-c", zellijCommand}, switchTo(w, s)}
+		}},
+		{"outside, new session", nil, "zellij 0.45.1", "other\n" + "label-and-more\n", false, func(w, s string) [][]string {
+			return [][]string{version, list, {"zellij", "attach", "--create", s, "--", "/bin/sh", "-c", zellijCommand}}
+		}},
+		{"outside, no sessions at all", nil, "zellij 0.45.1", "", false, func(w, s string) [][]string {
+			return [][]string{version, list, {"zellij", "attach", "--create", s, "--", "/bin/sh", "-c", zellijCommand}}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			setenv(t, c.env)
+			worktree, session := zellijWorktree(f)
+			f.stub("zellij-version", c.version+"\n")
+			if sessions := strings.ReplaceAll(c.sessions, "label", session); sessions != "" {
+				if c.exists {
+					sessions += session + "\n"
+				}
+				f.stub("zellij-sessions", sessions)
+			}
+			if err := f.launchIn("zellij", "feature/x.y", zellijCommand); err != nil {
+				t.Fatal(err, f.stderr.String())
+			}
+			checkCalls(t, zellijCalls(f), c.want(worktree, session))
+			// attaching in the worktree is what runs a command there, when the session is created with it
+			if cwd, err := os.ReadFile(filepath.Join(f.stubState, "zellij-cwd")); err == nil && string(cwd) != worktree {
+				t.Errorf("attached in %q", cwd)
+			}
+		})
+	}
+}
+
+// Every failure is reported with the worktree, which stays, and none is retried or answered with another way
+// to open the command: nothing runs after the call that failed.
+func TestZellijCommandFailures(t *testing.T) {
+	saved := zellijClientWait
+	zellijClientWait /= 100 // a client that never connects: 100ms of waiting
+	t.Cleanup(func() { zellijClientWait = saved })
+	version := []string{"zellij", "--version"}
+	list := []string{"zellij", "list-sessions", "--short", "--no-formatting"}
+	create := func(flag, session string) []string {
+		return []string{"zellij", "attach", flag, session, "--", "/bin/sh", "-c", zellijCommand}
+	}
+	switchTo := func(worktree, session string) []string {
+		return []string{"zellij", "action", "switch-session", session, "--cwd", worktree}
+	}
+	attach := func(worktree, session string) []string {
+		return []string{"zellij", "attach", "--create", session, "options", "--default-cwd", worktree}
+	}
+	tab := func(worktree, session string) []string {
+		return []string{"zellij", "--session", session, "action", "new-tab", "--cwd", worktree, "--", "/bin/sh", "-c", zellijCommand}
+	}
+	for _, c := range []struct {
+		name   string
+		env    map[string]string
+		exists bool
+		stubs  map[string]string
+		prints string // what wt reports of zellij's message
+		want   func(worktree, session string) [][]string
+	}{
+		{"listing sessions", nil, false, map[string]string{"zellij-list-error": "boom\n"}, "boom",
+			func(w, s string) [][]string { return [][]string{version, list} }},
+		{"creating the session, outside", nil, false, map[string]string{"zellij-error": ""}, "exit status 1",
+			func(w, s string) [][]string { return [][]string{version, list, create("--create", s)} }},
+		{"creating the session, inside", inZellij, false, map[string]string{"zellij-error": "no room\n"}, "no room",
+			func(w, s string) [][]string {
+				return [][]string{version, version, list, create("--create-background", s)}
+			}},
+		{"switching to the session", inZellij, true, map[string]string{"zellij-error": "no switch\n"}, "no switch",
+			func(w, s string) [][]string { return [][]string{version, version, list, switchTo(w, s)} }},
+		{"attaching to the session", nil, true, map[string]string{"zellij-error": ""}, "exit status 1",
+			func(w, s string) [][]string { return [][]string{version, list, attach(w, s)} }},
+		{"attaching shows no client", nil, true, map[string]string{"zellij-no-client": ""}, "",
+			func(w, s string) [][]string { return [][]string{version, list, attach(w, s)} }},
+		{"switching shows no client", inZellij, true, map[string]string{"zellij-no-client": ""}, "",
+			func(w, s string) [][]string { return [][]string{version, version, list, switchTo(w, s)} }},
+		{"opening the tab, inside", inZellij, true, map[string]string{"zellij-tab-error": "no tab\n"}, "no tab",
+			func(w, s string) [][]string {
+				return [][]string{version, version, list, switchTo(w, s), tab(w, s)}
+			}},
+		{"opening the tab, outside", nil, true, map[string]string{"zellij-tab-error": "no tab\n"}, "no tab",
+			func(w, s string) [][]string { return [][]string{version, list, attach(w, s), tab(w, s)} }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			setenv(t, c.env)
+			worktree, session := zellijWorktree(f)
+			if c.exists {
+				f.stub("zellij-sessions", session+"\n")
+			}
+			for name, content := range c.stubs {
+				f.stub(name, content)
+			}
+			if f.launchIn("zellij", "feature/x.y", zellijCommand) == nil {
+				t.Fatal("succeeded")
+			}
+			msg := f.stderr.String()
+			if want := "wt: worktree ready at " + worktree + "; Zellij session could not be opened: "; !strings.Contains(msg, want) || !strings.Contains(msg, c.prints) {
+				t.Errorf("stderr %q", msg)
+			}
+			if !exists(worktree) {
+				t.Error("worktree removed")
+			}
+			checkCalls(t, zellijCalls(f), c.want(worktree, session))
+		})
+	}
+}
+
+// Opening a tab with a command needs zellij 0.44 even outside Zellij, where attaching to a session doesn't.
+func TestZellijCommandNeedsZellij044(t *testing.T) {
+	f := setup(t)
+	worktree, session := zellijWorktree(f)
+	f.stub("zellij-version", "zellij 0.43.1\n")
+	if f.launchIn("zellij", "feature/x.y", "claude") == nil {
+		t.Fatal("succeeded")
+	}
+	if want := "wt: worktree ready at " + worktree + "; Zellij session could not be opened: "; !strings.Contains(f.stderr.String(), want) {
+		t.Errorf("stderr %q", f.stderr.String())
+	}
+	checkCalls(t, zellijCalls(f), [][]string{{"zellij", "--version"}})
+	f.clearCalls()
+	if err := f.switchIn("zellij", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, zellijCalls(f), [][]string{{"zellij", "attach", "--create", session, "options", "--default-cwd", worktree}})
+}
+
 // zellijSocketMax is the longest socket path Zellij accepts: it turns down 104 bytes or more on macOS, and
 // 108 or more elsewhere.
 func zellijSocketMax() int {
@@ -1398,6 +1612,36 @@ func TestCommandFailureKeepsWorktree(t *testing.T) {
 	}
 	if !exists(worktree) {
 		t.Error("worktree removed")
+	}
+}
+
+func TestCommandReceivesTheCommandAsData(t *testing.T) {
+	for _, c := range []struct {
+		name, inherited, command, want string
+	}{
+		{"a shell", "", "", "set|"},
+		{"a shell, not an inherited command", "stale", "", "set|"},
+		{"a command, not an inherited one", "stale", "claude --resume", "set|claude --resume"},
+		{"a command nothing acts on", "", "echo $(touch pwned)\n'x'", "set|echo $(touch pwned)\n'x'"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			out := filepath.Join(f.root, "out")
+			setenv(t, map[string]string{"OUT": out,
+				"WT_OPEN_COMMAND": `printf '%s|%s' "${WT_COMMAND+set}" "$WT_COMMAND" > "$OUT"`})
+			if c.inherited != "" {
+				t.Setenv("WT_COMMAND", c.inherited)
+			}
+			if err := f.launchIn("command", "feature/x.y", c.command); err != nil {
+				t.Fatal(err, f.stderr.String())
+			}
+			if got, _ := os.ReadFile(out); string(got) != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+			if exists(filepath.Join(f.repo, "feature/x.y", "pwned")) {
+				t.Error("the command ran as part of WT_OPEN_COMMAND")
+			}
+		})
 	}
 }
 

@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -256,8 +258,28 @@ func zellijLabelSize() int {
 	return min(zellijLabelMax, longest-len(zellijSocketDir())-1)
 }
 
-// zellijVersion matches the output of zellij --version, as zellij 0.45.1, for its major and minor numbers.
-var zellijVersion = regexp.MustCompile(`^zellij ([0-9]+)\.([0-9]+)`)
+// zellijVersion matches the output of zellij --version, as zellij 0.45.1, for its major, minor and patch
+// numbers.
+var zellijVersion = regexp.MustCompile(`^zellij ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?`)
+
+// zellijInstalled is what zellij --version says, and the three numbers in it: 0.0.0 when it says none.
+func zellijInstalled() (string, []int) {
+	out, _ := exec.Command("zellij", "--version").Output()
+	version := strings.TrimSpace(string(out))
+	numbers := make([]int, 3)
+	if m := zellijVersion.FindStringSubmatch(version); m != nil {
+		for i := range numbers {
+			// Atoi only fails on a missing patch number, or on one too big for an int, which is later than any
+			numbers[i], _ = strconv.Atoi(m[i+1])
+		}
+	}
+	return version, numbers
+}
+
+// zellijSince tells whether version numbers are major.minor.patch or later.
+func zellijSince(numbers []int, major, minor, patch int) bool {
+	return slices.Compare(numbers, []int{major, minor, patch}) >= 0
+}
 
 // zellijCheck checks zellij is there, that its socket folder leaves room for session names and, inside
 // Zellij, that it can switch sessions from the command line, which came with Zellij 0.44.
@@ -275,15 +297,7 @@ func zellijCheck() error {
 	if os.Getenv("ZELLIJ") == "" {
 		return nil
 	}
-	out, _ := exec.Command("zellij", "--version").Output()
-	version := strings.TrimSpace(string(out))
-	var major, minor int
-	if m := zellijVersion.FindStringSubmatch(version); m != nil {
-		// Atoi only fails on a number too big for an int, and that is later than 0.44
-		major, _ = strconv.Atoi(m[1])
-		minor, _ = strconv.Atoi(m[2])
-	}
-	if major == 0 && minor < 44 {
+	if version, numbers := zellijInstalled(); !zellijSince(numbers, 0, 44, 0) {
 		wtError("switching Zellij sessions needs zellij 0.44 or later, not '" + version + "'")
 		return errReported
 	}
@@ -292,27 +306,170 @@ func zellijCheck() error {
 
 // zellijOpen switches to (or, outside Zellij, attaches) the worktree's Zellij session (one per worktree),
 // creating it in the worktree when there's none. Sessions are found by name, so a renamed one is no longer
-// reused. Attaching shows Zellij's own errors, and returns how it ended.
+// reused. A command runs in a new tab of the session, shown; or in the first tab of the session created for
+// it, from zellij 0.45.1, which can start a session with one: before, the new session has its shell tab
+// first. Attaching shows Zellij's own errors, and returns how it ended.
 func zellijOpen(path, branch, command string) error {
 	path, err := canonical(path)
 	if err != nil {
 		return err
 	}
 	session := sessionLabel(path, branch, zellijLabelSize())
-	if os.Getenv("ZELLIJ") != "" {
-		// switch-session creates a missing session in --cwd, and leaves an existing one as it is
-		out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
-		if msg := strings.TrimRight(string(out), "\n"); err != nil && msg != "" {
-			return errors.New(msg)
+	inside := os.Getenv("ZELLIJ") != ""
+	if command == "" {
+		if inside {
+			return zellijSwitch(session, path)
 		}
+		return zellijAttach(session, path).Run()
+	}
+	// zellijCheck doesn't know there's a command, so its version is checked here, before Zellij is changed
+	version, numbers := zellijInstalled()
+	if !zellijSince(numbers, 0, 44, 0) {
+		return fmt.Errorf("opening a worktree with a command needs zellij 0.44 or later, not '%s'", version)
+	}
+	if zellijSince(numbers, 0, 45, 1) {
+		exists, err := zellijSessionExists(session)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return zellijCreate(session, path, command, inside)
+		}
+	}
+	// The session is shown before the tab is opened: zellij 0.45 has no room for a tab when no client is
+	// connected to size it.
+	if inside {
+		if err := zellijSwitch(session, path); err != nil {
+			return err
+		}
+		return zellijTab(session, path, command, nil)
+	}
+	attach := zellijAttach(session, path)
+	if err := attach.Start(); err != nil {
 		return err
 	}
+	ended := make(chan struct{})
+	var attachErr error
+	go func() {
+		attachErr = attach.Wait()
+		close(ended)
+	}()
+	tabErr := zellijTab(session, path, command, ended)
+	<-ended
+	if attachErr != nil {
+		return attachErr
+	}
+	return tabErr
+}
+
+// zellijAttach is the command that attaches to the session in wt's terminal, creating it in the worktree at
+// path when there's none.
+func zellijAttach(session, path string) *exec.Cmd {
 	// attach has no --cwd: a new session starts in the default cwd, which options sets over the
 	// configuration's, or else in the directory zellij runs in. An existing session stays as it is.
-	cmd := exec.Command("zellij", "attach", "--create", session, "options", "--default-cwd", path)
-	cmd.Dir = path
+	return zellijTerminal(path, "attach", "--create", session, "options", "--default-cwd", path)
+}
+
+// zellijTerminal is zellij with args, run in the directory dir and wt's terminal.
+func zellijTerminal(dir string, args ...string) *exec.Cmd {
+	cmd := exec.Command("zellij", args...)
+	cmd.Dir = dir
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	return cmd
+}
+
+// zellijSwitch switches the client of the Zellij session wt runs in to the worktree's session.
+func zellijSwitch(session, path string) error {
+	// switch-session creates a missing session in --cwd, and leaves an existing one as it is
+	out, err := exec.Command("zellij", "action", "switch-session", session, "--cwd", path).CombinedOutput()
+	if err != nil {
+		return zellijFailure(out, err)
+	}
+	return nil
+}
+
+// zellijFailure is why a zellij command failed: its message, or else how it ended.
+func zellijFailure(out []byte, err error) error {
+	if msg := strings.TrimRight(string(out), "\n"); msg != "" {
+		return errors.New(msg)
+	}
+	return err
+}
+
+// zellijSessionExists tells whether Zellij has a session called name, running or exited: attaching to an
+// exited one brings it back as it was.
+func zellijSessionExists(name string) (bool, error) {
+	out, err := exec.Command("zellij", "list-sessions", "--short", "--no-formatting").Output()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) {
+			msg := strings.TrimSpace(string(exit.Stderr))
+			// Zellij exits 1 saying so when it has no sessions, as it does for a failure
+			if strings.Contains(msg, "No active zellij sessions found") {
+				return false, nil
+			}
+			if msg != "" {
+				err = errors.New(msg)
+			}
+		}
+		return false, fmt.Errorf("can't list Zellij sessions: %w", err)
+	}
+	return slices.Contains(lines(string(out)), name), nil
+}
+
+// zellijCreate creates the session with command in its first tab, in the worktree at path, and shows it:
+// attaching to it as it's created, or, inside Zellij, creating it in the background to switch to it. Zellij
+// has no way to create a session only when there's none: one created since zellijOpen looked is attached to
+// as it is, and the command isn't run.
+func zellijCreate(session, path, command string, inside bool) error {
+	if !inside {
+		return zellijTerminal(path, "attach", "--create", session, "--", "/bin/sh", "-c", command).Run()
+	}
+	cmd := exec.Command("zellij", "attach", "--create-background", session, "--", "/bin/sh", "-c", command)
+	cmd.Dir = path
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return zellijFailure(out, err)
+	}
+	return zellijSwitch(session, path)
+}
+
+// zellijClientWait is how long to wait for a client to connect to a session: the one attaching or switching
+// takes milliseconds, and Zellij a few seconds at most to bring an exited session back.
+var zellijClientWait = 10 * time.Second
+
+const zellijPoll = 50 * time.Millisecond
+
+// zellijTab opens a tab running command, in the worktree at path, in the session. It waits for a client to
+// be connected to the session first, to show the tab and to size it, until ended (if not nil) is closed by
+// the attach meant to connect it. Opening the tab is never retried: a failure may come after the command
+// started.
+func zellijTab(session, path, command string, ended <-chan struct{}) error {
+	deadline := time.Now().Add(zellijClientWait)
+	for last := false; !zellijHasClient(session); {
+		if last {
+			return fmt.Errorf("attaching to session %s ended with no client connected to it: the command wasn't started", session)
+		}
+		select {
+		case <-ended:
+			// one more look at the clients, since the attach may have ended after one connected
+			last = true
+		case <-time.After(zellijPoll):
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no client connected to session %s in %s: the command wasn't started", session, zellijClientWait)
+		}
+	}
+	out, err := exec.Command("zellij", "--session", session, "action", "new-tab", "--cwd", path, "--", "/bin/sh", "-c", command).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("can't open a tab in session %s: %w", session, zellijFailure(out, err))
+	}
+	return nil
+}
+
+// zellijHasClient tells whether a client is connected to the session: zellij lists them under a header.
+func zellijHasClient(session string) bool {
+	out, err := exec.Command("zellij", "--session", session, "action", "list-clients").Output()
+	return err == nil && len(lines(string(out))) > 1
 }
 
 // Rex
@@ -470,14 +627,16 @@ func commandCheck() error {
 }
 
 // commandOpen runs WT_OPEN_COMMAND with sh, in the worktree and in wt's terminal. The worktree comes in
-// WT_WORKTREE, WT_BRANCH and WT_SESSION rather than in the command's text, so that no branch name can change
-// what it runs. The command reports its own errors; wt adds how it ended.
+// WT_WORKTREE, WT_BRANCH and WT_SESSION, and the command to run in it, a shell snippet, in WT_COMMAND (empty
+// to open a shell, and set then too, so that none inherited is taken for it), rather than in the command's
+// text, so that no branch name or command can change what it runs. The command reports its own errors; wt
+// adds how it ended.
 func commandOpen(path, branch, command string) error {
 	dir, err := canonical(path)
 	if err == nil {
 		cmd := exec.Command("sh", "-c", os.Getenv("WT_OPEN_COMMAND"))
 		cmd.Dir = dir
-		cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+dir, "WT_BRANCH="+branch, "WT_SESSION="+sessionLabel(dir, branch, rexLabelSize))
+		cmd.Env = append(cmd.Environ(), "WT_WORKTREE="+dir, "WT_BRANCH="+branch, "WT_SESSION="+sessionLabel(dir, branch, rexLabelSize), "WT_COMMAND="+command)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 		err = cmd.Run()
 	}
