@@ -1,11 +1,17 @@
 name: Release
 
-# Create a GitHub Release and update the Homebrew formula.
+# Build the wt binaries, attach them to a GitHub Release, and update the Homebrew formula.
 # Trigger by pushing a version tag, e.g.:  git tag v1.0.0 && git push origin v1.0.0
+# Or run manually from the Actions tab, supplying a tag.
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to create (e.g. v1.0.0)'
+        required: true
 
 permissions:
   contents: write
@@ -16,27 +22,42 @@ jobs:
     steps:
       - name: Check out release tag
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve release metadata
         id: release
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
           if [[ ! "${TAG}" =~ ^v[0-9] ]]; then
             echo "Release tag must start with v, for example v1.0.0." >&2
             exit 1
           fi
           echo "tag=${TAG}" >>"${GITHUB_OUTPUT}"
-          echo "version=${TAG#v}" >>"${GITHUB_OUTPUT}"
 
-      - name: Compute tarball sha
-        id: tarball
+      - name: Check out manual tag if it exists
+        if: github.event_name == 'workflow_dispatch'
         env:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          SHA256="$(curl -fsSL "https://github.com/gugahoi/wt/archive/refs/tags/${TAG}.tar.gz" | shasum -a 256 | cut -d ' ' -f 1)"
-          echo "sha256=${SHA256}" >>"${GITHUB_OUTPUT}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            git checkout "${TAG}"
+          else
+            echo "Tag ${TAG} does not exist yet; the release will create it from this commit."
+          fi
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build release assets
+        run: ./scripts/build-release.sh "${{ steps.release.outputs.tag }}" dist
 
       - name: Publish GitHub Release
         env:
@@ -45,9 +66,11 @@ jobs:
         run: |
           set -euo pipefail
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists."
+            gh release upload "${TAG}" dist/*.tar.gz --clobber
+          elif git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            gh release create "${TAG}" dist/*.tar.gz --title "${TAG}" --generate-notes
           else
-            gh release create "${TAG}" --title "${TAG}" --generate-notes
+            gh release create "${TAG}" dist/*.tar.gz --title "${TAG}" --generate-notes --target "${GITHUB_SHA}"
           fi
 
       - name: Generate Homebrew tap token
@@ -63,11 +86,11 @@ jobs:
         env:
           TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
           TAG: ${{ steps.release.outputs.tag }}
-          SHA256: ${{ steps.tarball.outputs.sha256 }}
+          ASSET_DIR: dist
         run: |
           set -euo pipefail
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/gugahoi/homebrew-tap.git" homebrew-tap
-          ./scripts/write-formula.sh "${TAG}" "${SHA256}" homebrew-tap/Formula/wt.rb
+          ./scripts/write-formula.sh "${TAG}" "${ASSET_DIR}" homebrew-tap/Formula/wt.rb
           git -C homebrew-tap config user.name "github-actions[bot]"
           git -C homebrew-tap config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C homebrew-tap add Formula/wt.rb

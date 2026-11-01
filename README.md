@@ -8,7 +8,9 @@
 brew install gugahoi/tap/wt
 ```
 
-Dependencies: `git`, `fzf` and `gh` are required; `tmux`, or Rex plus `jq`, is needed to open sessions.
+Or download the binary for your platform (macOS or Linux, arm64 or amd64) from the [latest release](https://github.com/gugahoi/wt/releases/latest) and put `wt` on your `PATH`.
+
+`wt` is a single binary with fzf built in. It runs `git`, and `tmux` or Rex to open sessions. `wt issue` and `wt pr` log in to GitHub with `GH_TOKEN`, or with `gh` if it's installed and logged in.
 
 ## Usage
 
@@ -27,25 +29,30 @@ Usage:
   wt list             List all active worktrees
   wt -h | --help      Show this help documentation
 
+GitHub (wt issue, wt pr):
+  The repository is the one gh would use (GH_REPO, or the git remotes). The token comes from GH_TOKEN or
+  GITHUB_TOKEN, or else from gh's login (gh auth login).
+
 Multiplexer (WT_MULTIPLEXER=auto | tmux | rex):
   auto, the default, opens worktrees in tmux inside tmux ($TMUX), in Rex inside a live Rex session
   ($REX_SESSION, confirmed with the Rex server), and otherwise in tmux, creating or attaching its session.
   tmux inside Rex picks tmux; set WT_MULTIPLEXER=rex for Rex. A picked multiplexer that fails is reported,
   never swapped for the other, and the worktree it was opening is kept.
   tmux  One session per branch, named after it; the same branch in two repositories shares one.
-  Rex   Needs rex and jq (without them, auto picks tmux even inside Rex). One session per worktree,
+  Rex   Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
         labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
         REX_CLIENT picks the Rex app when several are connected.
   Deleting a worktree leaves its session running, and a worktree recreated at the same path reuses it.
 ```
 
-## Tests
+## Development
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_wt.py'
+go test ./...
+go build
 ```
 
-Requires `git`, `bash` and `jq`.
+The tests need `git`; tmux and Rex are stubbed.
 
 ## Releasing
 
@@ -53,4 +60,4 @@ Requires `git`, `bash` and `jq`.
 git tag vX.Y.Z && git push origin vX.Y.Z
 ```
 
-The release workflow creates the GitHub Release and updates `Formula/wt.rb` in [gugahoi/homebrew-tap](https://github.com/gugahoi/homebrew-tap).
+Or run the Release workflow from the Actions tab with a tag. It builds the binaries with `scripts/build-release.sh`, attaches them to the GitHub Release, and writes `Formula/wt.rb` in [gugahoi/homebrew-tap](https://github.com/gugahoi/homebrew-tap) with `scripts/write-formula.sh`.
