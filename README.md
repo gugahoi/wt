@@ -87,6 +87,19 @@ export WT_OPEN_COMMAND='wezterm cli spawn --new-window --workspace "$WT_SESSION"
 export WT_OPEN_COMMAND='kitten @ launch --type=tab --tab-title "$WT_BRANCH" --cwd "$WT_WORKTREE"'
 ```
 
+### Setting up in the background
+
+wt waits for `wt.setupCommand` to finish before it opens the worktree, but only for its `sh -c` to exit, so a command that puts the setup in the background lets the worktree open straight away. `nohup` keeps the setup running when wt's terminal closes, as a tmux popup does when wt exits. Its output goes to a log in the worktree's git folder, where it isn't an untracked file:
+
+```sh
+git config wt.setupCommand 'nohup pnpm install > "$(git rev-parse --git-dir)/wt-setup.log" 2>&1 &'
+
+# what it printed, from the worktree
+cat "$(git rev-parse --git-dir)/wt-setup.log"
+```
+
+wt can't tell then whether the setup worked, and the worktree opens before it's finished: a command that needs it, such as a dev server, can start too early.
+
 ## Development
 
 ```sh
