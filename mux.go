@@ -184,6 +184,11 @@ func tmuxOpen(path, branch, command string) error {
 	inside := os.Getenv("TMUX") != ""
 	window := []string{"-c", path}
 	if command != "" {
+		// tmux reads an argument ending in ";" as a command separator, dropping a backslash before it, so a
+		// command ending in ";" (find -exec ... \;) needs one more.
+		if strings.HasSuffix(command, ";") {
+			command = command[:len(command)-1] + `\;`
+		}
 		window = append(window, "/bin/sh", "-c", command)
 	}
 	if command == "" && !inside {
@@ -394,7 +399,7 @@ func rexOpen(path, branch, command string) error {
 	if len(ids) > 1 {
 		return fmt.Errorf("several sessions are labelled %s: %s", label, strings.Join(ids, ", "))
 	}
-	return rexSelect(ids[0])
+	return rexSelect(ids[0], "")
 }
 
 // rexOpenWindow runs command in a new window of the session, in the worktree at path, and shows it. A
@@ -410,14 +415,17 @@ func rexOpenWindow(id, path, command string) error {
 	if json.Unmarshal(out, &window) != nil || window.WindowID == "" {
 		return fmt.Errorf("can't read rex window new response for session %s: invalid JSON or missing window_id", id)
 	}
-	return rexSelect(id, "window_id="+window.WindowID)
+	return rexSelect(id, window.WindowID)
 }
 
-// rexSelect shows the session in the Rex app, at the given window_id=<id> when there is one.
-func rexSelect(id string, window ...string) error {
-	args := append([]string{"do", "session.select", "session_id=" + id}, window...)
+// rexSelect shows the session in the Rex app, at windowID when it's not empty.
+func rexSelect(sessionID, windowID string) error {
+	args := []string{"do", "session.select", "session_id=" + sessionID}
+	if windowID != "" {
+		args = append(args, "window_id="+windowID)
+	}
 	if out, err := exec.Command("rex", args...).CombinedOutput(); err != nil {
-		return fmt.Errorf("can't show session %s: %s", id, strings.TrimRight(string(out), "\n"))
+		return fmt.Errorf("can't show session %s: %s", sessionID, strings.TrimRight(string(out), "\n"))
 	}
 	return nil
 }

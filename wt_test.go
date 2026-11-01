@@ -1893,6 +1893,90 @@ func TestCommandSessions(t *testing.T) {
 	}
 }
 
+func TestCommandTmuxTrailingSemicolon(t *testing.T) {
+	// tmux takes an argument ending in ";" as a command separator, and drops a backslash before it.
+	for _, c := range []struct{ command, want string }{
+		{`find . -exec echo {} \;`, `find . -exec echo {} \\;`},
+		{`echo a;`, `echo a\;`},
+		{`;`, `\;`},
+		{`echo a; echo b`, `echo a; echo b`},
+		{`echo \; ok`, `echo \; ok`},
+	} {
+		for _, exists := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%q, session exists %t", c.command, exists), func(t *testing.T) {
+				f := setup(t)
+				setenv(t, inTmux)
+				if exists {
+					f.stub("tmux-has-session", "")
+				}
+				path := f.switchFeature()
+				f.clearCalls()
+				if err := f.launchIn("tmux", "feature/x.y", c.command); err != nil {
+					t.Fatal(err, f.stderr.String())
+				}
+				open := []string{"tmux", "new-session", "-d", "-s", "feature_x_y", "-c", path, "/bin/sh", "-c", c.want}
+				if exists {
+					open = []string{"tmux", "new-window", "-t", "=feature_x_y:", "-c", path, "/bin/sh", "-c", c.want}
+				}
+				checkCalls(t, f.calls(), [][]string{
+					{"tmux", "has-session", "-t", "=feature_x_y"},
+					open,
+					{"tmux", "switch-client", "-t", "=feature_x_y"},
+				})
+			})
+		}
+	}
+}
+
+func TestCommandTmuxSharedSessionOpensWhereSelected(t *testing.T) {
+	f := setup(t)
+	setenv(t, inTmux)
+	f.git("branch", "topic")
+	if err := f.switchIn("tmux", "topic"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	// The branch of another repository names the same session, which then exists.
+	other := filepath.Join(f.root, "other")
+	if err := os.Mkdir(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(other)
+	f.git("init", "-q", "-b", "main")
+	f.git("config", "user.name", "Test")
+	f.git("config", "user.email", "test@example.com")
+	f.git("commit", "-q", "--allow-empty", "-m", "base")
+	f.git("branch", "topic")
+	f.stub("tmux-has-session", "")
+	f.clearCalls()
+	if err := f.launchIn("tmux", "topic", "claude"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.calls(), [][]string{
+		{"tmux", "has-session", "-t", "=topic"},
+		{"tmux", "new-window", "-t", "=topic:", "-c", filepath.Join(other, "topic"), "/bin/sh", "-c", "claude"},
+		{"tmux", "switch-client", "-t", "=topic"},
+	})
+}
+
+func TestCommandRexWindowOpensWhereSelected(t *testing.T) {
+	f, worktree, _ := rexFixture(t)
+	// The worktree's session exists already; selecting it from another worktree adds the window at the selected one.
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	f.git("worktree", "add", "-q", "-b", "elsewhere", filepath.Join(f.root, "elsewhere"))
+	t.Chdir(filepath.Join(f.root, "elsewhere"))
+	f.clearCalls()
+	if err := f.launchIn("rex", "feature/x.y", "claude"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.rexCalls(), [][]string{
+		{"ls", "--json"},
+		{"window", "new", "-s", session(0), "-c", worktree, "--json", "--", "/bin/sh", "-c", "claude"},
+		{"do", "session.select", "session_id=" + session(0), "window_id=" + windowID(1)},
+	})
+}
+
 func TestCommandDefaultOnClone(t *testing.T) {
 	f := setup(t)
 	f.config(`{"default_command": "claude"}`)
