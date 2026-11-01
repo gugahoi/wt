@@ -1532,17 +1532,15 @@ func TestCommandConfig(t *testing.T) {
 		}
 	}
 
-	// A broken configuration stops the commands opening worktrees before any picker, change or multiplexer.
+	// A broken configuration stops the commands opening worktrees before any picker, change, multiplexer or
+	// GitHub refresh. No cache is written, so a refresh would be tried, and fail (the remote isn't GitHub's),
+	// with another error than the configuration's.
 	file := f.config(`{"keymaps": {"ctrl-x": "claude"}}`)
 	t.Setenv("WT_MULTIPLEXER", "rex")
-	if err := writeCache("issues", []string{"5\t2026-01-01T00:00:00Z\tAn issue\t"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writeCache("prs", []string{"7\t2026-01-01T00:00:00Z\tfalse\tfalse\tpr-branch\tTitle\tme\t"}); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv("GH_REPO", "")
 	cloned := filepath.Join(f.root, "cloned")
-	f.picks(nil, 0)
+	refs, trees := f.git("for-each-ref"), f.git("worktree", "list", "--porcelain")
+	f.picks([]string{"new-topic", "enter"}, fzf.ExitNoMatch)
 	for _, args := range [][]string{nil, {"issue"}, {"pr"}, {"clone", f.remote, cloned}} {
 		f.stderr.Reset()
 		if run(args) == 0 || !strings.Contains(f.stderr.String(), "wt: config "+file+`: keymap key "ctrl-x" is reserved`) {
@@ -1551,6 +1549,13 @@ func TestCommandConfig(t *testing.T) {
 	}
 	if f.pickerShown || exists(cloned) || mux != nil {
 		t.Errorf("picker shown %t, cloned %t, multiplexer %v", f.pickerShown, exists(cloned), mux)
+	}
+	if f.git("for-each-ref") != refs || f.git("worktree", "list", "--porcelain") != trees {
+		t.Errorf("branches or worktrees changed:\n%s\n%s", f.git("for-each-ref"), f.git("worktree", "list", "--porcelain"))
+	}
+	// Opening the pickers (and the files behind them) or refreshing the lists would have left these.
+	if dir, ok := os.LookupEnv("WT_REFRESHED"); ok || exists(filepath.Join(f.repo, ".git", "wt-state")) {
+		t.Errorf("a picker was set up: WT_REFRESHED %q, state folder %t", dir, exists(filepath.Join(f.repo, ".git", "wt-state")))
 	}
 	checkCalls(t, f.calls(), nil)
 	// Commands that don't open worktrees don't read it.
@@ -1744,6 +1749,47 @@ func TestCommandIssueSelection(t *testing.T) {
 	}
 }
 
+// The prompts after picking an issue offer the command it was picked with, not the configured default,
+// and Enter in them keeps it.
+func TestCommandIssuePromptsInheritTheCommand(t *testing.T) {
+	f := setup(t)
+	f.config(`{"default_command": "claude", "keymaps": {"ctrl-o": "opencode"}}`)
+	if err := writeCache("issues", []string{"5\t2026-01-01T00:00:00Z\tAn issue\t"}); err != nil {
+		t.Fatal(err)
+	}
+	f.git("branch", "5-existing")
+	issue := issueLines()[0]
+	var enter []string // what Enter does in each picker shown after the first, as the footers say
+	f.answer(pickAnswer{[]string{"", "ctrl-o", issue}, fzf.ExitOk},
+		pickAnswer{[]string{"", "enter", "+ new branch"}, fzf.ExitOk}, pickAnswer{[]string{"my-fix", "enter"}, fzf.ExitNoMatch})
+	answer := pick
+	pick = func(input []string, args ...string) ([]string, int) {
+		if f.pickerShown { // not the first
+			opts, err := fzfOptions(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			enter = append(enter, strings.Join(opts.Footer, "\n"))
+		}
+		return answer(input, args...)
+	}
+	mux = nil
+	if err := cmdGitHub("issue"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if len(enter) != 2 {
+		t.Fatalf("%d nested pickers shown", len(enter))
+	}
+	for i, footer := range enter {
+		if !strings.HasPrefix(footer, "Enter: "+strconv.Quote("opencode")) || strings.Contains(footer, strconv.Quote("claude")) {
+			t.Errorf("picker %d's footer %q", i+1, footer)
+		}
+	}
+	fix := filepath.Join(f.repo, "5-my-fix")
+	checkCalls(t, f.calls(), [][]string{{"tmux", "has-session", "-t", "=5-my-fix"},
+		{"tmux", "new-session", "-s", "5-my-fix", "-c", fix, "/bin/sh", "-c", "opencode"}})
+}
+
 func TestCommandPRSelection(t *testing.T) {
 	f := setup(t)
 	t.Setenv("WT_MULTIPLEXER", "rex")
@@ -1785,6 +1831,51 @@ func TestCommandPRSelection(t *testing.T) {
 	checkCalls(t, f.launches(), nil)
 	if !slices.Equal(f.windows(), want) {
 		t.Errorf("windows %q", f.windows())
+	}
+}
+
+// A PR from a fork is fetched from refs/pull/<n>/head, and its branch opened, with the command, in the
+// session it already has; a failed fetch opens nothing.
+func TestCommandCrossRepoPR(t *testing.T) {
+	f := setup(t)
+	f.config(`{"default_command": "claude", "keymaps": {"ctrl-o": "opencode"}}`)
+	f.git("update-ref", "refs/pull/9/head", "HEAD")
+	f.git("push", "-q", "origin", "refs/pull/9/head")
+	f.git("update-ref", "-d", "refs/pull/9/head")
+	if err := writeCache("prs", []string{"9\t2026-01-01T00:00:00Z\tfalse\ttrue\tfork-branch\tFork\tthem\t",
+		"10\t2026-01-01T00:00:00Z\tfalse\ttrue\tlost-branch\tLost\tthem\t"}); err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]string{}
+	for _, line := range prLines() {
+		rows[strings.Split(line, "\t")[1]] = line
+	}
+	open := func(n, key string) error {
+		return f.runPicking(func() error { return cmdGitHub("pr") }, pickAnswer{[]string{"", key, rows[n]}, fzf.ExitOk})
+	}
+	worktree := filepath.Join(f.repo, "fork-branch")
+	probe := []string{"tmux", "has-session", "-t", "=fork-branch"}
+
+	if err := open("9", "ctrl-o"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if !f.hasRef("refs/heads/fork-branch") {
+		t.Error("branch not fetched")
+	}
+	checkCalls(t, f.calls(), [][]string{probe, {"tmux", "new-session", "-s", "fork-branch", "-c", worktree, "/bin/sh", "-c", "opencode"}})
+	f.stub("tmux-has-session", "")
+	if err := open("9", "enter"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	checkCalls(t, f.calls(), [][]string{probe, {"tmux", "new-window", "-t", "=fork-branch:", "-c", worktree, "/bin/sh", "-c", "claude"},
+		{"tmux", "attach-session", "-t", "=fork-branch"}})
+
+	if open("10", "ctrl-o") == nil || !strings.Contains(f.stderr.String(), "failed to fetch PR #10") {
+		t.Errorf("stderr %q", f.stderr.String())
+	}
+	checkCalls(t, f.calls(), nil)
+	if f.hasRef("refs/heads/lost-branch") || exists(filepath.Join(f.repo, "lost-branch")) {
+		t.Error("branch or worktree created")
 	}
 }
 

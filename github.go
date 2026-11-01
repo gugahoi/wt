@@ -489,12 +489,12 @@ func openIssue(n string, cfg commandConfig, command string) error {
 		}
 	}
 	if len(matches) > 0 {
-		picked, picker, err := pickLaunch(append([]string{newBranch}, matches...), cfg, command, false, "--ansi",
+		picked, pickedCommand, err := pickLaunch(append([]string{newBranch}, matches...), cfg, command, false, "--ansi",
 			"--no-sort", "--delimiter=\t", "--with-nth=1,2", "--prompt=#"+n+"> ")
 		if err != nil || picked == "" {
 			return err
 		}
-		branch, command = picked, picker
+		branch, command = picked, pickedCommand
 	}
 	if branch == newBranch {
 		title := ""
@@ -504,12 +504,12 @@ func openIssue(n string, cfg commandConfig, command string) error {
 				break
 			}
 		}
-		named, picker, err := pickLaunch(nil, cfg, command, true, "--prompt=New branch> ", "--info=hidden",
+		named, namedCommand, err := pickLaunch(nil, cfg, command, true, "--prompt=New branch> ", "--info=hidden",
 			"--query="+n+"-"+slug(title))
 		if err != nil || named == "" {
 			return err
 		}
-		if branch, command = named, picker; !strings.HasPrefix(branch, n+"-") {
+		if branch, command = named, namedCommand; !strings.HasPrefix(branch, n+"-") {
 			branch = n + "-" + branch
 		}
 	}
