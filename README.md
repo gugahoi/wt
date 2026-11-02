@@ -21,7 +21,8 @@ Usage:
   wt                  Interactively select a branch to switch to (creating worktree if needed)
                       - Press [Ctrl-x] inside the selection menu to delete the worktree and branch
                         (local deletions run in the background; remote-only entries require confirmation)
-  wt issue            Pick an open GitHub issue (newest first) and switch to (or create) a <number>-* branch for it
+  wt issue [number]   Pick an open GitHub issue (newest first), or take the numbered one, and switch to (or create)
+                      a <number>-* branch for it
   wt pr               Pick an open GitHub pull request (ready first, then drafts; newest first) and switch to its branch
                       - Press [Ctrl-t] inside either picker to switch between issues and pull requests
   wt clone <url> [dir] Clone a repository as bare and set up worktrees
