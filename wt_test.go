@@ -2109,6 +2109,44 @@ func TestCommandIssuePromptsInheritTheCommand(t *testing.T) {
 		{"tmux", "new-session", "-s", "5-my-fix", "-c", fix, "/bin/sh", "-c", "opencode"}})
 }
 
+// wt issue <number> skips the issue picker: the new branch's prompt is named after that issue, and the
+// worktree opens with the default command. Anything but a number fails before any picker shows.
+func TestIssueByNumber(t *testing.T) {
+	f := setup(t)
+	t.Setenv("WT_MULTIPLEXER", "rex")
+	f.config(`{"default_command": "claude"}`)
+	if err := writeCache("issues", []string{"4\t2026-01-02T00:00:00Z\tAnother one\t", "5\t2026-01-01T00:00:00Z\tFix the thing\t"}); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"issue", "#5"}); code == 0 || !strings.Contains(f.stderr.String(), "'#5' is not an issue number") {
+		t.Errorf("exit %d: %q", code, f.stderr.String())
+	}
+	var query string
+	err := f.runPicking(func() error {
+		answer := pick
+		pick = func(input []string, args ...string) ([]string, int) {
+			opts, err := fzfOptions(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query = opts.Query
+			return answer(input, args...)
+		}
+		if run([]string{"issue", "5"}) != 0 {
+			return errors.New("wt issue 5 failed")
+		}
+		return nil
+	}, pickAnswer{[]string{"5-fix-the-thing", "enter"}, fzf.ExitNoMatch})
+	if err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if query != "5-fix-the-thing" {
+		t.Errorf("prompt's query %q", query)
+	}
+	worktree := filepath.Join(f.repo, "5-fix-the-thing")
+	checkCalls(t, f.launches(), [][]string{{"new", "repo-5-fix-the-thing-" + gitHash(worktree)[:10], "-c", worktree, "--json", "--", "/bin/sh", "-c", "claude"}})
+}
+
 func TestCommandPRSelection(t *testing.T) {
 	f := setup(t)
 	t.Setenv("WT_MULTIPLEXER", "rex")
