@@ -2147,6 +2147,29 @@ func TestIssueByNumber(t *testing.T) {
 	checkCalls(t, f.launches(), [][]string{{"new", "repo-5-fix-the-thing-" + gitHash(worktree)[:10], "-c", worktree, "--json", "--", "/bin/sh", "-c", "claude"}})
 }
 
+// wt pr <number> skips the PR picker: that PR's branch is fetched and its worktree opens with the default
+// command. Anything but a number fails, and nothing opens.
+func TestPRByNumber(t *testing.T) {
+	f := setup(t)
+	t.Setenv("WT_MULTIPLEXER", "rex")
+	f.config(`{"default_command": "claude"}`)
+	f.remoteBranch("pr-branch")
+	f.git("update-ref", "-d", "refs/remotes/origin/pr-branch")
+	if err := writeCache("prs", []string{"6\t2026-01-02T00:00:00Z\tfalse\tfalse\tother-branch\tOther\tme\t",
+		"7\t2026-01-01T00:00:00Z\tfalse\tfalse\tpr-branch\tTitle\tme\t"}); err != nil {
+		t.Fatal(err)
+	}
+	if code := run([]string{"pr", "#7"}); code == 0 || !strings.Contains(f.stderr.String(), "'#7' is not a pull request number") {
+		t.Errorf("exit %d: %q", code, f.stderr.String())
+	}
+	checkCalls(t, f.launches(), nil)
+	if code := run([]string{"pr", "7"}); code != 0 {
+		t.Fatalf("exit %d: %q", code, f.stderr.String())
+	}
+	worktree := filepath.Join(f.repo, "pr-branch")
+	checkCalls(t, f.launches(), [][]string{{"new", "repo-pr-branch-" + gitHash(worktree)[:10], "-c", worktree, "--json", "--", "/bin/sh", "-c", "claude"}})
+}
+
 func TestCommandPRSelection(t *testing.T) {
 	f := setup(t)
 	t.Setenv("WT_MULTIPLEXER", "rex")
