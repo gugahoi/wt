@@ -483,31 +483,54 @@ func cmdGitHub(kind string) error {
 	return nil
 }
 
-// cmdIssue opens open issue n, with the default command, as picking it in `wt issue` would. The issues are
-// fetched from GitHub first when n isn't in the cache, so one opened since the last fetch is found.
+// cmdIssue opens open issue n, with the default command, as picking it in `wt issue` would.
 func cmdIssue(n string) error {
-	if !isNumber(n) {
-		return fmt.Errorf("'%s' is not an issue number", n)
-	}
-	if _, err := muxSetting(); err != nil {
-		return err
-	}
-	cfg, err := loadCommandConfig()
+	cfg, err := numbered("issue", n)
 	if err != nil {
 		return err
 	}
+	return openIssue(n, cfg, cfg.DefaultCommand)
+}
+
+// cmdPR opens open pull request n, with the default command, as picking it in `wt pr` would.
+func cmdPR(n string) error {
+	cfg, err := numbered("pr", n)
+	if err != nil {
+		return err
+	}
+	return openPR(n, cfg.DefaultCommand)
+}
+
+// numbered checks that n is the number of an open issue or PR (kind), and loads the command config. The
+// issues or PRs are fetched from GitHub first when n isn't in the cache, so one opened since the last fetch
+// is found.
+func numbered(kind, n string) (commandConfig, error) {
+	noun, article := "issue", "an"
+	if kind == "pr" {
+		noun, article = "pull request", "a"
+	}
+	if !isNumber(n) {
+		return commandConfig{}, fmt.Errorf("'%s' is not %s %s number", n, article, noun)
+	}
+	if _, err := muxSetting(); err != nil {
+		return commandConfig{}, err
+	}
+	cfg, err := loadCommandConfig()
+	if err != nil {
+		return commandConfig{}, err
+	}
 	cached := func() bool {
-		return slices.ContainsFunc(readCache("issues"), func(f []string) bool { return f[0] == n })
+		return slices.ContainsFunc(readCache(kind+"s"), func(f []string) bool { return f[0] == n })
 	}
 	if !cached() {
-		if err := refresh("issue"); err != nil {
-			return err
+		if err := refresh(kind); err != nil {
+			return commandConfig{}, err
 		}
 		if !cached() {
-			return fmt.Errorf("no open issue #%s", n)
+			return commandConfig{}, fmt.Errorf("no open %s #%s", noun, n)
 		}
 	}
-	return openIssue(n, cfg, cfg.DefaultCommand)
+	return cfg, nil
 }
 
 // openIssue offers the issue's existing <number>-* branches or a new one named in an editable prompt, and

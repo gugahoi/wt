@@ -23,7 +23,8 @@ Usage:
                         (local deletions run in the background; remote-only entries require confirmation)
   wt issue [number]   Pick an open GitHub issue (newest first), or take the numbered one, and switch to (or create)
                       a <number>-* branch for it
-  wt pr               Pick an open GitHub pull request (ready first, then drafts; newest first) and switch to its branch
+  wt pr [number]      Pick an open GitHub pull request (ready first, then drafts; newest first), or take the
+                      numbered one, and switch to its branch
                       - Press [Ctrl-t] inside either picker to switch between issues and pull requests
   wt clone <url> [dir] Clone a repository as bare and set up worktrees
   wt rm | delete      Interactively select a worktree to remove (with a confirmation prompt)
