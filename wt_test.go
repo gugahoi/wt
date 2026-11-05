@@ -48,6 +48,10 @@ var rexInspect = map[string]any{
 	},
 }
 
+var rexClientList = map[string]any{"clients": []any{rexInspect["client"],
+	map[string]any{"client_id": "client:cli", "info": map[string]any{"kind": "cli", "name": "rex"}},
+}}
+
 var (
 	rexWhoamiLive = map[string]any{
 		"rex_version": "0.0.1793131181-gdd9a20", "session_count": 1,
@@ -164,12 +168,19 @@ func stub(name string, args []string) int {
 	for strings.HasPrefix(args[0], "--") {
 		args = args[1:]
 	}
+	if args[0] == "-C" {
+		args = args[2:]
+	}
 	switch args[0] {
 	case "whoami":
 		print(read("whoami.json", map[string]any{}))
 	case "client":
 		fail("client-error", 3)
-		print(read("inspect.json", rexInspect))
+		if args[1] == "ls" {
+			print(read("clients.json", rexClientList))
+		} else {
+			print(read("inspect.json", rexInspect))
+		}
 	case "ls":
 		print(map[string]any{"sessions": read("sessions.json", []any{})})
 	case "new":
@@ -895,7 +906,7 @@ func TestRexFailureNeverFallsBackOrMemoizes(t *testing.T) {
 // A multiplexer that can't open the worktree fails before wt changes anything.
 
 func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
-	noSelect := map[string]any{"actions": []any{rexInspect["actions"].([]any)[0]}}
+	noSelect := map[string]any{"client": rexInspect["client"], "actions": []any{rexInspect["actions"].([]any)[0]}}
 	// One byte less than a label needs to keep a whole character of its name before the hash
 	noRoom := socketDirLeaving(labelSuffixSize + utf8.UTFMax - 1)
 	tooLong := "Zellij's socket folder " + noRoom + "/contract_version_1 is too long for session names: set a shorter ZELLIJ_SOCKET_DIR"
@@ -922,8 +933,8 @@ func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 		{"rex missing", map[string]string{"WT_MULTIPLEXER": "rex", "PATH": f.pathWithout("rex")}, nil, "needs rex"},
 		{"server down", map[string]string{"WT_MULTIPLEXER": "rex"}, []any{"client-error", "Error: rex server is not running\n"},
 			"rex server is not running"},
-		{"ambiguous apps", map[string]string{"WT_MULTIPLEXER": "rex"},
-			[]any{"client-error", "Error: 2 app clients are connected; choose one with -C\n"}, "REX_CLIENT"},
+		{"no apps", map[string]string{"WT_MULTIPLEXER": "rex"},
+			[]any{"clients.json", map[string]any{"clients": []any{}}}, "no Rex app"},
 		{"no session.select", map[string]string{"WT_MULTIPLEXER": "rex"}, []any{"inspect.json", noSelect}, "no session.select"},
 		{"no command", map[string]string{"WT_MULTIPLEXER": "command"}, nil, "needs WT_OPEN_COMMAND"},
 	} {
@@ -946,7 +957,7 @@ func (f *fixture) checkPreflight(run func() error, mutated func() bool) {
 			}
 			for _, call := range f.calls() {
 				if call[0] == "tmux" || call[0] == "zellij" && call[1] != "--version" ||
-					slices.Equal(call[:2], []string{"rex", "new"}) || slices.Equal(call[:2], []string{"rex", "do"}) {
+					slices.Equal(call[:2], []string{"rex", "new"}) || call[0] == "rex" && slices.Contains(call, "do") {
 					t.Errorf("called %q", call)
 				}
 			}
@@ -1067,8 +1078,12 @@ func (f *fixture) launchIn(name, branch, command string) error {
 func (f *fixture) rexCalls() [][]string {
 	var calls [][]string
 	for _, call := range f.calls() {
-		if call[0] == "rex" && !slices.Equal(call[1:3], []string{"--autostart=false", "client"}) {
-			calls = append(calls, call[1:])
+		if call[0] == "rex" && call[1] != "--autostart=false" {
+			args := call[1:]
+			if len(args) > 2 && args[0] == "-C" && args[2] == "do" {
+				args = args[2:]
+			}
+			calls = append(calls, args)
 		}
 	}
 	return calls
@@ -1127,6 +1142,170 @@ func rexFixture(t *testing.T) (*fixture, string, string) {
 	f := setup(t)
 	worktree := filepath.Join(f.repo, "feature/x.y")
 	return f, worktree, "repo-feature_x.y-" + gitHash(worktree)[:10]
+}
+
+func rexApp(id, label string, sessions ...string) map[string]any {
+	return map[string]any{"client_id": id, "info": map[string]any{
+		"kind": "app", "name": "Rex Beta", "platform": "macos", "label": label},
+		"connection_state": "connected", "session_ids": sessions}
+}
+
+func rexInspectApp(id string) map[string]any {
+	return map[string]any{"client": rexApp(id, "studio"), "actions": rexInspect["actions"]}
+}
+
+func TestRexPickerChoosesAndPinsApp(t *testing.T) {
+	f, worktree, _ := rexFixture(t)
+	const first = "client:01a1800a-b4f1-71d8-be7a-e38922f26a90"
+	const second = "client:01a1800a-b4f1-71d8-be7a-e38922f26a91"
+	// Both apps have the same label. The app attached to this session is marked, but the other can be chosen.
+	f.stub("clients.json", map[string]any{"clients": []any{
+		rexApp(first, "studio", inRex["REX_SESSION"]), rexApp(second, "studio"),
+		map[string]any{"client_id": "client:cli", "info": map[string]any{"kind": "cli"}},
+	}})
+	f.stub("whoami.json", rexWhoamiLive)
+	f.stub("inspect.json", rexInspectApp(second))
+	setenv(t, inRex)
+	t.Setenv("FZF_DEFAULT_OPTS", "--multi --exit-0 --expect=ctrl-y --filter=studio")
+	t.Setenv("FZF_DEFAULT_OPTS_FILE", "")
+	shown := false
+	pick = func(input []string, args ...string) ([]string, int) {
+		shown = true
+		if f.hasRef("refs/heads/feature/x.y") || exists(worktree) {
+			t.Error("worktree changed before the app was picked")
+		}
+		if len(input) != 2 || !strings.HasPrefix(input[0], "* ") || !strings.HasPrefix(input[1], "  ") ||
+			!strings.Contains(input[0], first[len(first)-12:]) ||
+			!strings.Contains(input[1], second[len(second)-12:]) || input[0] == input[1] {
+			t.Errorf("picker rows %q", input)
+		}
+		opts, err := fzfOptions(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if opts.Multi != 0 || opts.Exit0 || opts.Filter != nil || len(opts.Expect) != 0 {
+			t.Errorf("picker options: multi %d, exit-0 %t, filter %v, expect %v", opts.Multi, opts.Exit0, opts.Filter, opts.Expect)
+		}
+		return []string{"output from a user's fzf print binding", input[1]}, fzf.ExitOk
+	}
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if !shown || os.Getenv("REX_CLIENT") != "" {
+		t.Errorf("picker shown %t, REX_CLIENT %q", shown, os.Getenv("REX_CLIENT"))
+	}
+	var checked, selected bool
+	for _, call := range f.calls() {
+		checked = checked || slices.Equal(call, []string{"rex", "--autostart=false", "-C", second, "client", "inspect", "--json"})
+		selected = selected || slices.Equal(call, []string{"rex", "-C", second, "do", "session.select", "session_id=" + session(0)})
+	}
+	if !checked || !selected {
+		t.Errorf("inspected chosen app %t, selected in it %t: calls %q", checked, selected, f.calls())
+	}
+}
+
+func TestRexExplicitClientSkipsPicker(t *testing.T) {
+	f, _, _ := rexFixture(t)
+	const selected = "client:01a1800a-b4f1-71d8-be7a-e38922f26a91"
+	t.Setenv("REX_CLIENT", "studio")
+	f.stub("inspect.json", rexInspectApp(selected))
+	if err := f.switchIn("rex", "feature/x.y"); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	var inspected, shown bool
+	for _, call := range f.calls() {
+		inspected = inspected || slices.Equal(call, []string{"rex", "--autostart=false", "-C", "studio", "client", "inspect", "--json"})
+		shown = shown || slices.Equal(call, []string{"rex", "-C", selected, "do", "session.select", "session_id=" + session(0)})
+		if slices.Equal(call[:3], []string{"rex", "--autostart=false", "client"}) {
+			t.Errorf("listed apps despite REX_CLIENT: %q", call)
+		}
+	}
+	if !inspected || !shown {
+		t.Errorf("inspected explicit app %t, showed worktree in it %t: %q", inspected, shown, f.calls())
+	}
+}
+
+func TestRexClientPickerCancellation(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		run  func(*fixture) error
+		left func(*fixture) bool
+	}{
+		{"switch", func(f *fixture) error { return switchToBranch("new-branch", "") },
+			func(f *fixture) bool {
+				return f.hasRef("refs/heads/new-branch") || exists(filepath.Join(f.repo, "new-branch"))
+			}},
+		{"clone", func(f *fixture) error { return cmdClone(f.remote, "cloned") },
+			func(f *fixture) bool { return exists(filepath.Join(f.repo, "cloned")) }},
+		{"PR", func(f *fixture) error { return openPR("7", "") },
+			func(f *fixture) bool {
+				return f.hasRef("refs/heads/pr-branch") || f.hasRef("refs/remotes/origin/pr-branch")
+			}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			if c.name == "PR" {
+				f.remoteBranch("pr-branch")
+				f.git("update-ref", "-d", "refs/remotes/origin/pr-branch")
+				if err := writeCache("prs", []string{"7\t2026-01-01T00:00:00Z\tfalse\tfalse\tpr-branch\tTitle\tme\t"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("WT_MULTIPLEXER", "rex")
+			f.stub("clients.json", map[string]any{"clients": []any{
+				rexApp("client:one", "one"), rexApp("client:two", "two")}})
+			f.picks(nil, fzf.ExitInterrupt)
+			if err := c.run(f); !errors.Is(err, errCancelled) || mux != nil || !f.pickerShown {
+				t.Errorf("error %v, multiplexer %v, picker shown %t", err, mux, f.pickerShown)
+			}
+			if c.left(f) {
+				t.Error("cancelled picker changed the repository")
+			}
+			if f.stderr.Len() != 0 {
+				t.Errorf("stderr %q", f.stderr.String())
+			}
+			for _, call := range f.rexCalls() {
+				if call[0] == "new" || call[0] == "do" {
+					t.Errorf("opened a Rex session after cancellation: %q", call)
+				}
+			}
+		})
+	}
+}
+
+func TestRexClientPickerFailure(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		out  []string
+		code int
+		want string
+	}{
+		{"no interactive terminal", nil, fzf.ExitError, "set REX_CLIENT"},
+		{"invalid row", []string{"client:forged"}, fzf.ExitOk, "invalid Rex app picker selection"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := setup(t)
+			t.Setenv("WT_MULTIPLEXER", "rex")
+			f.stub("clients.json", map[string]any{"clients": []any{
+				rexApp("client:one", "one"), rexApp("client:two", "two")}})
+			f.picks(c.out, c.code)
+			if err := switchToBranch("new-branch", ""); !errors.Is(err, errReported) ||
+				!strings.Contains(f.stderr.String(), c.want) || f.hasRef("refs/heads/new-branch") {
+				t.Errorf("error %v, stderr %q", err, f.stderr.String())
+			}
+		})
+	}
+}
+
+func TestRexCancelExitsSuccessfully(t *testing.T) {
+	f := setup(t)
+	t.Setenv("WT_MULTIPLEXER", "rex")
+	f.stub("clients.json", map[string]any{"clients": []any{
+		rexApp("client:one", "one"), rexApp("client:two", "two")}})
+	f.picks(nil, fzf.ExitInterrupt)
+	if code := run([]string{"clone", f.remote, "cloned"}); code != 0 || exists(filepath.Join(f.repo, "cloned")) {
+		t.Errorf("exit code %d, cloned %t", code, exists(filepath.Join(f.repo, "cloned")))
+	}
 }
 
 func TestRexCreatesSessionThenReusesIt(t *testing.T) {
