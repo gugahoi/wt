@@ -17,6 +17,8 @@ import (
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	fzf "github.com/junegunn/fzf/src"
 )
 
 // WT_MULTIPLEXER picks the terminal multiplexer worktrees open in, by name, or auto (the default): the first
@@ -474,41 +476,161 @@ func zellijHasClient(session string) bool {
 
 // Rex
 
-// rexInside tells whether wt runs in a Rex session the server knows. An inherited REX_SESSION can be stale,
-// so it only counts once the server confirms it (without starting a server).
-func rexInside() bool {
-	if os.Getenv("REX_SESSION") == "" {
-		return false
+// rexSession is the session wt runs in, when the Rex server confirms REX_SESSION is still valid. Checking
+// an inherited REX_SESSION never starts a server.
+func rexSession() string {
+	session := os.Getenv("REX_SESSION")
+	if session == "" {
+		return ""
 	}
 	out, err := exec.Command("rex", "--autostart=false", "whoami", "--json").Output()
 	var whoami struct {
-		SessionID *string `json:"session_id"`
+		SessionID string `json:"session_id"`
 	}
-	return err == nil && json.Unmarshal(out, &whoami) == nil && whoami.SessionID != nil
+	if err == nil && json.Unmarshal(out, &whoami) == nil && whoami.SessionID == session {
+		return session
+	}
+	return ""
 }
 
-// rexCheck checks there's a Rex app that can show sessions.
+func rexInside() bool { return rexSession() != "" }
+
+// rexClientID is the app chosen during preflight, pinned so connecting another app while wt opens the
+// worktree can't change which app shows its session.
+var rexClientID string
+
+type rexClient struct {
+	ClientID string `json:"client_id"`
+	Info     struct {
+		Kind, Label, Name, Platform string
+	}
+	ConnectionState string   `json:"connection_state"`
+	SessionIDs      []string `json:"session_ids"`
+}
+
+// rexApps lists connected app clients, not the CLI clients that also appear in rex client ls --json.
+func rexApps() ([]rexClient, error) {
+	out, err := exec.Command("rex", "--autostart=false", "client", "ls", "--json").CombinedOutput()
+	if err != nil {
+		if msg := strings.TrimRight(string(out), "\n"); msg != "" {
+			return nil, errors.New(msg)
+		}
+		return nil, err
+	}
+	var list struct{ Clients []rexClient }
+	if err := json.Unmarshal(out, &list); err != nil {
+		return nil, fmt.Errorf("can't read rex client ls: %w", err)
+	}
+	var apps []rexClient
+	for _, client := range list.Clients {
+		if client.Info.Kind == "app" && (client.ConnectionState == "" || client.ConnectionState == "connected") {
+			if client.ClientID == "" {
+				return nil, errors.New("rex client ls returned an app without a client_id")
+			}
+			apps = append(apps, client)
+		}
+	}
+	return apps, nil
+}
+
+// rexPickClient lets the user choose among app clients. The selected row must be one we supplied: the
+// visible label (possibly shared by several apps) never becomes the Rex target, only its full client ID.
+func rexPickClient(apps []rexClient) (string, error) {
+	session := rexSession()
+	rows := make([]string, len(apps))
+	for i, app := range apps {
+		name := app.Info.Name
+		if app.Info.Label != "" {
+			name = app.Info.Label
+			if app.Info.Name != "" {
+				name += " (" + app.Info.Name + ")"
+			}
+		}
+		if name == "" {
+			name = "Rex app"
+		}
+		if app.Info.Platform != "" {
+			name += " on " + app.Info.Platform
+		}
+		mark := "  "
+		if session != "" && slices.Contains(app.SessionIDs, session) {
+			mark = "* "
+		}
+		short := app.ClientID[max(0, len(app.ClientID)-12):]
+		rows[i] = fmt.Sprintf("%s%s [%s]\t%d", mark, strconv.Quote(name), strconv.Quote(short), i)
+	}
+	out, code := pick(rows, "--height=40%", "--no-multi", "--no-exit-0", "--no-expect", "--no-sort",
+		"--delimiter=\t", "--with-nth=1", "--prompt=Rex app> ",
+		"--header=Choose the Rex app to show the worktree in (* attached to this session)")
+	switch code {
+	case fzf.ExitInterrupt, fzf.ExitNoMatch:
+		return "", errCancelled
+	case fzf.ExitOk:
+		if len(out) == 0 {
+			return "", errCancelled
+		}
+		for i, row := range rows {
+			if out[len(out)-1] == row {
+				return apps[i].ClientID, nil
+			}
+		}
+		wtError("invalid Rex app picker selection")
+	default:
+		wtError("can't pick a Rex app interactively: set REX_CLIENT to a client ID from rex client ls")
+	}
+	return "", errReported
+}
+
+// rexCheck chooses and checks the Rex app before wt changes a worktree. REX_CLIENT overrides the picker.
 func rexCheck() error {
+	rexClientID = ""
 	if _, err := exec.LookPath("rex"); err != nil {
 		wtError("opening worktrees in Rex needs rex")
 		return errReported
 	}
-	out, err := exec.Command("rex", "--autostart=false", "client", "inspect", "--json").CombinedOutput()
+	target := os.Getenv("REX_CLIENT")
+	if target == "" {
+		apps, err := rexApps()
+		if err != nil {
+			wtError("can't list Rex apps: " + err.Error())
+			return errReported
+		}
+		switch len(apps) {
+		case 0:
+			wtError("no Rex app to open worktrees in")
+			return errReported
+		case 1:
+			target = apps[0].ClientID
+		default:
+			if target, err = rexPickClient(apps); err != nil {
+				return err
+			}
+		}
+	}
+	out, err := exec.Command("rex", "--autostart=false", "-C", target, "client", "inspect", "--json").CombinedOutput()
 	if err != nil {
-		wtError("no Rex app to open worktrees in (REX_CLIENT picks one): " + strings.TrimRight(string(out), "\n"))
+		wtError("can't inspect Rex app " + target + ": " + strings.TrimRight(string(out), "\n"))
 		return errReported
 	}
-	var client struct{ Actions []struct{ Name string } }
-	canSelect := false
-	if json.Unmarshal(out, &client) == nil {
-		for _, action := range client.Actions {
-			canSelect = canSelect || action.Name == "session.select"
+	var client struct {
+		Client struct {
+			ClientID string `json:"client_id"`
 		}
+		Actions []struct{ Name string }
+	}
+	if json.Unmarshal(out, &client) != nil || client.Client.ClientID == "" {
+		wtError("can't read Rex app details (invalid JSON or missing client_id)")
+		return errReported
+	}
+	canSelect := false
+	for _, action := range client.Actions {
+		canSelect = canSelect || action.Name == "session.select"
 	}
 	if !canSelect {
 		wtError("the Rex app can't show sessions (no session.select action)")
 		return errReported
 	}
+	rexClientID = client.Client.ClientID
 	return nil
 }
 
@@ -577,7 +699,7 @@ func rexOpenWindow(id, path, command string) error {
 
 // rexSelect shows the session in the Rex app, at windowID when it's not empty.
 func rexSelect(sessionID, windowID string) error {
-	args := []string{"do", "session.select", "session_id=" + sessionID}
+	args := []string{"-C", rexClientID, "do", "session.select", "session_id=" + sessionID}
 	if windowID != "" {
 		args = append(args, "window_id="+windowID)
 	}

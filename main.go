@@ -19,6 +19,9 @@ import (
 // errReported is returned once the user has been told what went wrong, so it needs no further message.
 var errReported = errors.New("reported")
 
+// errCancelled stops opening a worktree when the Rex app picker is dismissed, without reporting a failure.
+var errCancelled = errors.New("cancelled")
+
 // errOut receives wt's errors and the output of the git commands it runs on the user's behalf.
 var errOut io.Writer = os.Stderr
 
@@ -72,6 +75,9 @@ func run(args []string) int {
 	default:
 		err = cmdSwitch()
 	}
+	if errors.Is(err, errCancelled) {
+		return 0
+	}
 	if err != nil {
 		if !errors.Is(err, errReported) {
 			wtError(err.Error())
@@ -114,7 +120,9 @@ Multiplexer (WT_MULTIPLEXER=auto | tmux | zellij | rex | command):
            a shell tab first before.
   rex      Needs rex (without it, auto picks tmux even inside Rex). One session per worktree,
            labelled <repo>-<branch>-<path hash>; a renamed session is no longer reused.
-           REX_CLIENT picks the Rex app when several are connected.
+           When several Rex apps are connected, wt asks which one to show the worktree in;
+           Esc cancels without creating a worktree. REX_CLIENT selects an app by label or ID
+           (see rex client ls) without asking; set it when running without an interactive terminal.
   command  Runs WT_OPEN_COMMAND with sh, in the worktree and wt's terminal, with WT_WORKTREE (its path),
            WT_BRANCH, WT_SESSION (a <repo>-<branch>-<path hash> label) and WT_COMMAND (the command to run
            there, empty to open a shell) set. Never picked by auto.
