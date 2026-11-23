@@ -27,6 +27,7 @@ Usage:
                       numbered one, and switch to its branch
                       - Press [Ctrl-t] inside either picker to switch between issues and pull requests
   wt clone <url> [dir] Clone a repository as bare and set up worktrees
+  wt init [dir]       Initialize an empty directory (default: current) as a bare repo with a first worktree
   wt rm | delete      Interactively select a worktree to remove (with a confirmation prompt)
   wt list             List all active worktrees
   wt -h | --help      Show this help documentation
@@ -73,6 +74,12 @@ Setup (git config wt.setupCommand):
   the worktree unopened; a worktree that exists already isn't set up again. On a pull request's branch,
   an install command runs that branch's install scripts.
 ```
+
+### Start a new repository
+
+Run `wt init my-project` to create a project, or `wt init` in an empty directory. Like `wt clone`, it stores the bare repository in `.bare` and writes a `.git` file pointing to it. It also creates a linked worktree for Git's initial branch (set by `init.defaultBranch`). Make your first commit in the worktree path printed by `wt init`, not in the project root.
+
+`wt init` doesn't make a commit, run a setup command, or open a session. It requires Git 2.42 or newer.
 
 ### Other multiplexers
 

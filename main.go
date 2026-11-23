@@ -66,6 +66,17 @@ func run(args []string) int {
 		}
 	case "clone":
 		err = cmdClone(arg(1), arg(2))
+	case "init":
+		const usage = "Usage: wt init [dir]"
+		switch {
+		case len(args) > 2:
+			fmt.Fprintln(errOut, usage)
+			err = errReported
+		case arg(1) == "-h" || arg(1) == "--help":
+			fmt.Println(usage)
+		default:
+			err = cmdInit(arg(1))
+		}
 	case "rm", "delete":
 		err = cmdDelete(os.Stdin)
 	case "list":
@@ -99,6 +110,7 @@ Usage:
                       numbered one, and switch to its branch
                       - Press [Ctrl-t] inside either picker to switch between issues and pull requests
   wt clone <url> [dir] Clone a repository as bare and set up worktrees
+  wt init [dir]       Initialize an empty directory (default: current) as a bare repo with a first worktree
   wt rm | delete      Interactively select a worktree to remove (with a confirmation prompt)
   wt list             List all active worktrees
   wt -h | --help      Show this help documentation

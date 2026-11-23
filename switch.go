@@ -210,9 +210,9 @@ func isWorktree(path string) bool {
 	return err == nil && info.IsDir() && gitOK("-C", path, "rev-parse", "--is-inside-work-tree")
 }
 
-// addWorktree creates the worktree for branch at path. A branch that's neither local nor picked from a
-// remote is created off the latest origin/<default> (or the last fetched one when offline), without
-// tracking it, so the first push sets up origin/<branch>.
+// addWorktree creates the worktree for branch at path. A new branch starts from the latest
+// origin/<default> (or the last fetched one when offline), without tracking it. Without origin,
+// it starts from the local default branch or HEAD.
 func addWorktree(path, branch, remoteRef string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -234,6 +234,12 @@ func addWorktree(path, branch, remoteRef string) error {
 		if base == "" && local[name] {
 			base = name
 		}
+	}
+	if !gitOK("remote", "get-url", "origin") {
+		if base == "" {
+			base = "HEAD"
+		}
+		return gitRun("worktree", "add", "--no-track", "-b", branch, path, base)
 	}
 	if gitTo(nil, errOut, "fetch", "--quiet", "origin", base) != nil {
 		fmt.Fprintf(errOut, "wt: fetch failed, branching from last known origin/%s\n", base)
@@ -274,6 +280,43 @@ func setUpWorktree(path, branch string) error {
 	return nil
 }
 
+// cmdInit initializes a bare repository in dir and creates a linked worktree for its unborn branch.
+func cmdInit(dir string) error {
+	if dir == "" {
+		dir = "."
+	}
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	if len(entries) != 0 {
+		return fmt.Errorf("target directory %q is not empty", dir)
+	}
+	if err := gitRun("-C", dir, "init", "--bare", ".bare"); err != nil {
+		return err
+	}
+	if err := writeBareGitFile(dir); err != nil {
+		return err
+	}
+	branch, err := gitOutput("-C", dir, "symbolic-ref", "--short", "HEAD")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, branch)
+	if err := gitRun("-C", dir, "worktree", "add", "--orphan", "-b", branch, "--", path); err != nil {
+		return err
+	}
+	fmt.Printf("Make your first commit in %q.\n", path)
+	return nil
+}
+
 // cmdClone clones a repository as bare, into <dir>/.bare, and opens a worktree of its default branch.
 func cmdClone(url, dir string) error {
 	if url == "" {
@@ -309,7 +352,7 @@ func cmdClone(url, dir string) error {
 	if err := gitRun("-C", dir, "clone", "--bare", url, ".bare"); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: ./.bare\n"), 0o644); err != nil {
+	if err := writeBareGitFile(dir); err != nil {
 		return err
 	}
 	if err := gitRun("-C", dir, "config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"); err != nil {
@@ -328,6 +371,11 @@ func cmdClone(url, dir string) error {
 		return err
 	}
 	return muxOpenWorktree(path, branch, cfg.DefaultCommand)
+}
+
+// writeBareGitFile lets Git find the bare repository from the worktree parent directory.
+func writeBareGitFile(dir string) error {
+	return os.WriteFile(filepath.Join(dir, ".git"), []byte("gitdir: ./.bare\n"), 0o644)
 }
 
 // repoName is the name a clone of url gets: its last path component, without .git.

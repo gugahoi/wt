@@ -785,6 +785,62 @@ func TestCloneInsideTmuxCreatesAndSwitches(t *testing.T) {
 	})
 }
 
+func TestInitCreatesFirstWorktree(t *testing.T) {
+	f := setup(t)
+	t.Chdir(f.root)
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(f.root, "gitconfig"))
+	f.git("config", "--global", "init.defaultBranch", "trunk")
+	f.git("config", "--global", "wt.setupCommand", "exit 1")
+	t.Setenv("WT_MULTIPLEXER", "bogus")
+
+	dir := filepath.Join(f.root, "new project")
+	path := filepath.Join(dir, "trunk")
+	stdout, stderr, ok := f.wt("init", "new project")
+	if !ok || !strings.Contains(stdout, path) {
+		t.Fatalf("wt init: success=%t, stdout=%q, stderr=%q", ok, stdout, stderr)
+	}
+	if got := f.git("-C", dir, "rev-parse", "--path-format=absolute", "--is-bare-repository", "--git-common-dir"); got != "true\n"+filepath.Join(dir, ".bare") {
+		t.Errorf("unexpected bare repository: %q", got)
+	}
+	if got := f.git("-C", path, "symbolic-ref", "--short", "HEAD"); got != "trunk" {
+		t.Errorf("worktree branch = %q, want trunk", got)
+	}
+	if gitOK("-C", path, "rev-parse", "--verify", "HEAD") {
+		t.Fatal("wt init made a commit")
+	}
+	checkCalls(t, f.calls(), nil)
+
+	// After the first commit, wt can create another branch even without an origin.
+	f.git("-C", path, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "initial")
+	f.git("-C", dir, "config", "wt.setupCommand", "")
+	t.Setenv("WT_MULTIPLEXER", "tmux")
+	t.Chdir(dir)
+	if err := switchToBranch("feature", ""); err != nil {
+		t.Fatal(err, f.stderr.String())
+	}
+	if got, want := f.git("-C", "feature", "rev-parse", "HEAD"), f.git("-C", path, "rev-parse", "HEAD"); got != want {
+		t.Errorf("new branch starts at %s, want %s", got, want)
+	}
+}
+
+func TestInitCurrentDirectory(t *testing.T) {
+	f := setup(t)
+	dir := filepath.Join(f.root, "empty")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	if _, stderr, ok := f.wt("init"); !ok {
+		t.Fatalf("wt init: %s", stderr)
+	}
+	if _, stderr, ok := f.wt("init"); ok || !strings.Contains(stderr, "not empty") {
+		t.Fatalf("initializing an occupied directory: success=%t, stderr=%q", ok, stderr)
+	}
+	if stdout, stderr, ok := f.wt("list"); !ok || !strings.Contains(stdout, filepath.Join(dir, ".bare")) {
+		t.Fatalf("wt list: success=%t, stdout=%q, stderr=%q", ok, stdout, stderr)
+	}
+}
+
 // Multiplexer selection
 
 var (
